@@ -5,7 +5,17 @@ export interface QaCoreHealConfig {
   baseUrl?: string;
   testDir?: string;
   selectorPreference?: string[];
-  pageObjects?: { enabled?: boolean; dir?: string };
+  pageObjects?: {
+    enabled?: boolean;
+    dir?: string;
+    /**
+     * Page-object helper names that wrap `page.locator(...)`, e.g. `["$"]`
+     * for `this.$('css')`. Matched calls heal in-place as `this.$('...')`
+     * when the replacement stays CSS/XPath; semantic upgrades rewrite to
+     * `this.page.getByRole(...)` (and friends).
+     */
+    wrappers?: string[];
+  };
   auth?: { storageState?: string };
   /** "file#exportName" of a login function run before probing. */
   authSetup?: string;

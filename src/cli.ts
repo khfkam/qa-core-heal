@@ -416,6 +416,7 @@ async function main(): Promise<void> {
   const allowedLevels = cfg.selectorPreference as CascadeLevel[] | undefined;
   const followImports = cfg.pageObjects?.enabled !== false;
   const pageObjectDirs = cfg.pageObjects?.dir ? [fromCfg(cfg.pageObjects.dir)] : undefined;
+  const wrappers = cfg.pageObjects?.wrappers ?? [];
   // Authenticated probing: flag > qa-core.config.json auth.storageState;
   // with neither, heal auto-detects (playwright config use.storageState,
   // then conventional .auth paths). Only the file PATH is ever logged.
@@ -472,7 +473,7 @@ async function main(): Promise<void> {
   const runPass = async (writePass: boolean, events: boolean, targets?: HealTarget[]): Promise<HealResult> =>
     heal({
       specPaths: specs, baseUrl, project: cli.project, write: writePass, maxHeals, allowedLevels,
-      followImports, pageObjectDirs, storageState, targets,
+      followImports, pageObjectDirs, wrappers, storageState, targets,
       authSetup: cli.authSetup ?? cfg.authSetup,
       authSetupTimeout: cli.authSetupTimeout,
       settleMs: cli.settleMs,

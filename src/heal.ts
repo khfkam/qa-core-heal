@@ -72,6 +72,11 @@ export interface HealOptions {
   followImports?: boolean;
   /** Extra directories whose .ts/.js files are also scanned for locators. */
   pageObjectDirs?: string[];
+  /**
+   * Page-object helpers that wrap `page.locator`, e.g. `["$"]` for
+   * `this.$('css')`. Empty/undefined keeps stock page/this.page parsing.
+   */
+  wrappers?: string[];
   /** Playwright storage state file for authenticated pages. */
   storageState?: string;
   /**
@@ -239,7 +244,12 @@ interface LocatorCall {
   endCol: number;    // exclusive, within endLine
   /** The `page...getByX(...)` text, newlines collapsed for display; no trailing .first()/.click(). */
   raw: string;
-  root: string;      // 'page' or 'this.page'
+  root: string;      // 'page', 'this.page', or a wrapper root like 'this.$'
+  /**
+   * When set, the call was `this.<wrapper>(...)` rather than
+   * `page.locator(...)` / `this.page.locator(...)`.
+   */
+  wrapper?: string;
   method: LocatorMethod;
   level: CascadeLevel;
   frameChain: string[];
@@ -361,13 +371,18 @@ function parseArgs(method: LocatorMethod, argsRaw: string): LocatorArgs {
 
 /**
  * Extract every locator chain in a file: page[.frameLocator(...)].getByX(...)
- * / .locator(...). Scans the WHOLE source, not lines: a prettier-wrapped
- * call whose options object spans several lines (the real-world shape for
- * any getByRole with a long name + exact:true) is one call, parsed whole.
- * Missing those made run mode report a failing locator that exists
- * verbatim in the POM as "could not be matched to source".
+ * / .locator(...), plus optional page-object wrappers like this.$('css').
+ * Scans the WHOLE source, not lines: a prettier-wrapped call whose options
+ * object spans several lines (the real-world shape for any getByRole with a
+ * long name + exact:true) is one call, parsed whole. Missing those made run
+ * mode report a failing locator that exists verbatim in the POM as "could
+ * not be matched to source".
  */
-function parseLocatorCalls(src: string, file: string): LocatorCall[] {
+export function parseLocatorCalls(
+  src: string,
+  file: string,
+  wrappers: string[] = [],
+): LocatorCall[] {
   const calls: LocatorCall[] = [];
   // Line-start offsets, for offset -> (1-indexed line, 0-indexed col).
   const lineStarts: number[] = [0];
@@ -384,29 +399,47 @@ function parseLocatorCalls(src: string, file: string): LocatorCall[] {
     }
     return { line: lo + 1, col: offset - lineStarts[lo]! };
   };
-  const rootRe = /(?<![\w.$])(this\.page|page)\b/g;
+  const safeWrappers = wrappers.filter((w) => /^[A-Za-z_$][\w$]*$/.test(w));
+  const wrapperRoots = safeWrappers.map((w) => `this\\.${w.replace(/\$/g, '\\$')}`);
+  // Use a lookahead instead of \b: wrapper names may end in `$` (e.g. this.$),
+  // and `\b` never matches between `$` and `(`.
+  const rootRe = new RegExp(
+    `(?<![\\w.$])(this\\.page|page${wrapperRoots.length ? `|${wrapperRoots.join('|')}` : ''})(?![\\w$])`,
+    'g',
+  );
   let rm: RegExpExecArray | null;
   while ((rm = rootRe.exec(src)) !== null) {
     const root = rm[1]!;
+    const wrapper = safeWrappers.find((w) => root === `this.${w}`);
     let pos = rm.index + root.length;
     const frameChain: string[] = [];
     let matched: LocatorMethod | null = null;
     let open = -1;
-    // Consume any .frameLocator("...") prefixes, then the terminal locator method.
-    for (;;) {
-      if (src.startsWith('.frameLocator(', pos)) {
-        const fo = pos + '.frameLocator'.length;
-        const fc = matchParen(src, fo);
-        if (fc < 0) break;
-        const inner = firstString(src.slice(fo + 1, fc));
-        if (inner != null) frameChain.push(inner);
-        pos = fc + 1;
+    if (wrapper) {
+      // this.$('css'[, options]) — the call opens immediately after the root.
+      if (src[pos] === '(') {
+        matched = 'locator';
+        open = pos;
+      } else {
         continue;
       }
-      for (const m of LOCATOR_METHODS) {
-        if (src.startsWith('.' + m + '(', pos)) { matched = m; open = pos + 1 + m.length; break; }
+    } else {
+      // Consume any .frameLocator("...") prefixes, then the terminal locator method.
+      for (;;) {
+        if (src.startsWith('.frameLocator(', pos)) {
+          const fo = pos + '.frameLocator'.length;
+          const fc = matchParen(src, fo);
+          if (fc < 0) break;
+          const inner = firstString(src.slice(fo + 1, fc));
+          if (inner != null) frameChain.push(inner);
+          pos = fc + 1;
+          continue;
+        }
+        for (const m of LOCATOR_METHODS) {
+          if (src.startsWith('.' + m + '(', pos)) { matched = m; open = pos + 1 + m.length; break; }
+        }
+        break;
       }
-      break;
     }
     if (!matched || open < 0) continue;
     const close = matchParen(src, open);
@@ -423,7 +456,7 @@ function parseLocatorCalls(src: string, file: string): LocatorCall[] {
       // Collapse the wrapping for display and matching; the edit
       // coordinates above, not this text, drive the write-back.
       raw: src.slice(rm.index, close + 1).replace(/\s*\n\s*/g, ' '),
-      root, method: matched,
+      root, wrapper, method: matched,
       level: levelOf(matched, args), frameChain, args,
       trailing: src.slice(close + 1, lineEnd < 0 ? src.length : lineEnd),
     });
@@ -432,6 +465,30 @@ function parseLocatorCalls(src: string, file: string): LocatorCall[] {
     rootRe.lastIndex = close + 1;
   }
   return calls;
+}
+
+/**
+ * Build the replacement call text for a healed locator, preserving page-
+ * object wrappers when the heal stays on the CSS/XPath ladder.
+ */
+function emitReplacement(
+  call: LocatorCall,
+  level: CascadeLevel,
+  arg: Parameters<typeof emitLocatorCall>[1],
+  frameChain?: string[],
+): string {
+  const chain = frameChain && frameChain.length > 0 ? frameChain : undefined;
+  const cssLike = level === 'css' || level === 'css-tag-fix' || level === 'xpath';
+  if (call.wrapper && cssLike && !chain) {
+    const native = emitLocatorCall(level, arg, false, undefined);
+    const m = native.match(/^page\.locator\((.*)\)$/s);
+    if (m) return `this.${call.wrapper}(${m[1]})`;
+  }
+  let newRaw = emitLocatorCall(level, arg, false, chain);
+  // Wrappers that upgrade to a semantic locator, and native this.page calls,
+  // both want the `this.` prefix in front of emitLocatorCall's `page....`.
+  if (call.root === 'this.page' || call.wrapper) newRaw = 'this.' + newRaw;
+  return newRaw;
 }
 
 /* ─────────────────────── file + url discovery ─────────────────────── */
@@ -1561,7 +1618,7 @@ export async function heal(opts: HealOptions): Promise<HealResult> {
     }
     specFiles.set(sp, list);
   }
-  const calls = files.flatMap((f) => parseLocatorCalls(f.src, f.path));
+  const calls = files.flatMap((f) => parseLocatorCalls(f.src, f.path, opts.wrappers ?? []));
 
   const roots = [process.cwd()];
   const specRoot = projectRootFor(specPaths[0]!);
@@ -1830,8 +1887,7 @@ export async function heal(opts: HealOptions): Promise<HealResult> {
         href: el.hasAttribute('href'),
       })).catch(() => null);
       const same = await confirmSameElement(locator, confirmToken);
-      let newRaw = emitLocatorCall(level, arg, false, frameChain);
-      if (call.root === 'this.page') newRaw = 'this.' + newRaw;
+      const newRaw = emitReplacement(call, level, arg, frameChain);
       // Role correction: the original getByRole named its target EXACTLY
       // (exact:true) and the candidate carries that identical exact name at
       // role level — only the role differs (a link that became a button).
@@ -1986,11 +2042,12 @@ export async function heal(opts: HealOptions): Promise<HealResult> {
       })).catch(() => null);
       const candidateKind = info ? kindOfElement(info) : null;
       if (kindConflict(expectedKindsOf(call), candidateKind)) return null;
-      let newRaw = emitLocatorCall(
-        'css-tag-fix', hit.css, false,
+      const newRaw = emitReplacement(
+        call,
+        'css-tag-fix',
+        hit.css,
         call.frameChain.length > 0 ? call.frameChain : undefined,
       );
-      if (call.root === 'this.page') newRaw = 'this.' + newRaw;
       return {
         kind: 'resolved', newRaw, level: 'css-tag-fix',
         confirmed: true, unstableMatch: false,

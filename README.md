@@ -1,3 +1,5 @@
+> **Fork note (khfkam):** adds `pageObjects.wrappers` so page-object helpers like `this.$('css')` match Playwright `locator(...)` failures and rewrite in place. Branch: `feat/locator-wrappers`.
+
 # qa-core-heal
 
 qa-core-heal runs your failing Playwright tests, reads the failure evidence, and repairs broken locators. It refuses to guess: every heal is verified against the live page and re-tested, every refusal explains itself.

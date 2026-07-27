@@ -1,7 +1,7 @@
 {
   "name": "qa-core-heal",
-  "version": "0.3.0",
-  "description": "Deterministic selector healing for Playwright specs. No LLM, no API key.",
+  "version": "0.3.0-wrappers.0",
+  "description": "Deterministic selector healing for Playwright specs. Fork with pageObjects.wrappers support (this.$).",
   "type": "module",
   "license": "MIT",
   "engines": {
@@ -24,12 +24,13 @@
     "evals": "npm run build && node evals/run-evals.mjs",
     "test": "npm run build && node --test tests/*.test.mjs",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "prepare": "npm run build",
+    "test:wrappers": "npm run build && node --test tests/wrapper.test.mjs"
   },
   "dependencies": {
     "@playwright/test": "1.60.0",
-    "playwright": "1.60.0",
-    "qa-core-heal": "^0.1.0"
+    "playwright": "1.60.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

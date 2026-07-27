@@ -10,7 +10,8 @@ Lives in the repo root. Optional: when the file is absent the CLI falls back to 
   "selectorPreference": ["role", "label", "placeholder", "text", "alt", "title", "testid", "css", "xpath"],
   "pageObjects": {
     "enabled": true,
-    "dir": null
+    "dir": null,
+    "wrappers": ["$"]
   },
   "auth": {
     "storageState": null
@@ -34,6 +35,7 @@ Apply mode is always gated regardless of these settings: the CLI prints the full
 - `testDir`: infer from Playwright config `testDir`. This is the only directory heal will read or write test files in.
 - `selectorPreference`: an allow-list guard, not a reordering. The engine's resolve cascade order is fixed (that fixed order is what makes heal deterministic and verified). Any heal that resolves at a level not listed here is refused and reported. Remove `css` and `xpath` from the list to forbid last-resort heals entirely. A `css-tag-fix` heal (a compound CSS selector whose typo'd tag token was corrected) counts as `css` for this guard — listing `css` allows it, removing `css` forbids it.
 - `pageObjects.enabled`: when true, heals targeting locators defined in `pageObjects.dir` are applied there, not inlined into specs.
+- `pageObjects.wrappers`: helper method names that wrap `page.locator`, e.g. `["$"]` for `this.$('css')`. When set, heal matches those calls to Playwright's `locator(...)` failures and rewrites CSS/XPath heals back as `this.$('...')`. A heal that upgrades to a semantic locator (`getByRole`, etc.) rewrites as `this.page.getByRole(...)` instead.
 - `auth.storageState`: path to a Playwright storage state JSON for authenticated pages. If the app needs auth and this is not set, heal will hit login walls; detect this (heal failures all resolving to login page elements) and prompt the user to generate a storage state with Playwright's own auth setup, then point this field at it. A setupSpec option that runs an auth spec automatically is planned for v2; it is not in v1, so do not reference it.
 - `authSetup`: `"file#export"` (or `"file:export"`) naming the user's own login function, run against the probing page. When BOTH `authSetup` and a storage state are configured, the saved session is used first and an expired session automatically falls back to the login function ("saved session expired; falling back to auth setup") — never the reverse.
 - `heal.maxHealsPerRun`: safety cap, unset by default. If a run proposes more than this, stop and warn (see "When things go wrong" in SKILL.md; mass drift usually means environment problems).
