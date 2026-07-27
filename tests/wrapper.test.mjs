@@ -64,7 +64,7 @@ test('run-first heal rewrites this.$ typo in place', async () => {
   const base = `http://127.0.0.1:${server.address().port}`;
   const dir = fs.mkdtempSync(path.join(repoRoot, '.tmp-test-'));
   fs.mkdirSync(path.join(dir, 'tests'));
-  fs.mkdirSync(path.join(dir, 'pages'));
+  fs.mkdirSync(path.join(dir, 'pages/common'), { recursive: true });
   fs.writeFileSync(
     path.join(dir, 'package.json'),
     '{ "name": "wrapper-repro", "private": true, "type": "module" }',
@@ -72,12 +72,12 @@ test('run-first heal rewrites this.$ typo in place', async () => {
   fs.writeFileSync(
     path.join(dir, 'qa-core.config.json'),
     JSON.stringify({
-      pageObjects: { enabled: true, wrappers: ['$'] },
+      pageObjects: { enabled: true, dir: 'pages', wrappers: ['$'] },
       heal: { verifyAfterApply: false },
     }),
   );
   fs.writeFileSync(
-    path.join(dir, 'pages/menu.po.ts'),
+    path.join(dir, 'pages/common/menu.po.ts'),
     `import { Page } from '@playwright/test';
 export class MenuPage {
   constructor(private page: Page) {}
@@ -88,9 +88,13 @@ export class MenuPage {
 `,
   );
   fs.writeFileSync(
+    path.join(dir, 'pages/index.ts'),
+    "export * from './common/menu.po';\n",
+  );
+  fs.writeFileSync(
     path.join(dir, 'tests/menu.spec.ts'),
     `import { test } from '@playwright/test';
-import { MenuPage } from '../pages/menu.po';
+import { MenuPage } from '../pages';
 test('opens the menu', async ({ page }) => {
   await page.goto(${JSON.stringify(base + '/')});
   await new MenuPage(page).open();
@@ -114,7 +118,7 @@ test('opens the menu', async ({ page }) => {
     const report = JSON.parse(stdout.slice(stdout.indexOf('{')));
     assert.equal(report.healed, 1, JSON.stringify(report, null, 2));
     assert.equal(report.unmatchedFailures?.length ?? 0, 0, JSON.stringify(report, null, 2));
-    const healedSrc = fs.readFileSync(path.join(dir, 'pages/menu.po.ts'), 'utf8');
+    const healedSrc = fs.readFileSync(path.join(dir, 'pages/common/menu.po.ts'), 'utf8');
     assert.match(healedSrc, /this\.\$\(['"]#menu-toggle['"]\)/);
     assert.doesNotMatch(healedSrc, /#menu-toggl'/);
     assert.doesNotMatch(healedSrc, /#menu-toggl"/);

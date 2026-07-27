@@ -355,29 +355,38 @@ function gatherFiles(specPath, specSrc, followImports, pageObjectDirs, onFileErr
             }
         }
     }
-    // Extra page-object directories from config. Scanned flat (not recursive),
-    // sorted for a deterministic scan order, deduped against imported files.
+    // Extra page-object directories from config. Scan recursively because real
+    // POM trees group pages/fragments several levels deep and often expose them
+    // through `export *` barrels that the import-only walker above cannot follow.
+    // Paths stay sorted for deterministic scan order and are deduped against
+    // imported files. Symlinks are skipped for cycle safety.
     for (const d of pageObjectDirs ?? []) {
-        let names = [];
-        try {
-            names = fs.readdirSync(d);
-        }
-        catch {
-            continue;
-        }
-        for (const name of names.sort()) {
-            if (!/\.(ts|js)$/.test(name))
-                continue;
-            const p = path.resolve(d, name);
+        const paths = [];
+        const walk = (dir) => {
+            let entries;
+            try {
+                entries = fs.readdirSync(dir, { withFileTypes: true });
+            }
+            catch (e) {
+                onFileError?.('walk', dir, e);
+                return;
+            }
+            for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+                const p = path.join(dir, entry.name);
+                if (entry.isSymbolicLink())
+                    continue;
+                if (entry.isDirectory()) {
+                    walk(p);
+                    continue;
+                }
+                if (entry.isFile() && /\.(ts|js)$/.test(entry.name))
+                    paths.push(p);
+            }
+        };
+        walk(path.resolve(d));
+        for (const p of paths.sort()) {
             if (seen.has(p))
                 continue;
-            try {
-                if (!fs.statSync(p).isFile())
-                    continue;
-            }
-            catch {
-                continue;
-            }
             seen.add(p);
             try {
                 files.push({ path: p, src: fs.readFileSync(p, 'utf8') });
