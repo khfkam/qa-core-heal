@@ -62,8 +62,28 @@ function wordTokens(s: string): string[] {
 
 const GENERATED_WORD = (w: string): boolean => /^\d+$/.test(w) || (/^[0-9a-f]{4,}$/i.test(w) && /\d/.test(w));
 
-/** Attribute kinds whose values ARE human identity (accessible names). */
-const NAME_ISH = new Set(['aria-label', 'label', 'placeholder', 'text']);
+/**
+ * Attribute kinds whose values ARE human identity (accessible-name
+ * sources). Deliberately EXCLUDES raw leaf 'text': a page's prose can
+ * contain the token as one word among many ("Record primary (blue)
+ * button click...") without being that element's identity — text values
+ * fall under the same word-coverage rule as ids.
+ */
+const NAME_ISH = new Set(['aria-label', 'label', 'placeholder']);
+
+/**
+ * Selector-SHAPED strings observed as page text. Documentation pages
+ * (uitestingplayground's /classattr, tutorial sites) display XPath and
+ * CSS selectors as code samples; a selector names how to FIND an element,
+ * not what an element is — never a candidate, never a match, never named
+ * in a refusal.
+ */
+export function isSelectorLikeText(v: string): boolean {
+  const t = v.trim();
+  return /^(?:\(*\/\/|\.\/|xpath=|css=)/.test(t)
+    || /\[@[A-Za-z_-]+/.test(t)
+    || /^[#.][A-Za-z_][\w-]*(?:[.#:[][^\s]*)?$/.test(t);
+}
 
 /** Strong-match score for token containment: above the fuzzy band, below exact. */
 const CONTAINMENT_SCORE = 0.9;
@@ -190,6 +210,7 @@ export function matchFuzzy(source: string, candidates: FuzzyCandidate[]): FuzzyV
     let best: { value: string; score: number } | null = null;
     let bestGenerated: { value: string; score: number } | null = null;
     for (const v of c.values) {
+      if (isSelectorLikeText(v)) continue;
       if (isGeneratedIdentifier(v)) {
         const g = similarity(source, v);
         if (!bestGenerated || g > bestGenerated.score) bestGenerated = { value: v, score: g };

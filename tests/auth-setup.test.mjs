@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 
 const repoRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const { heal } = await import(path.join(repoRoot, 'dist', 'heal.js'));
-const { loadAuthSetup } = await import(path.join(repoRoot, 'dist', 'auth-setup.js'));
+const { loadAuthSetup, isLoaderNoise } = await import(path.join(repoRoot, 'dist', 'auth-setup.js'));
 
 const APP_HTML = '<html><body><h1>App</h1><label for="quantity">Quantity</label><input id="quantity" type="text" /></body></html>';
 const LOGIN_HTML = '<html><body><h1>Log in</h1><label for="email">Email</label><input id="email" type="text" /></body></html>';
@@ -316,17 +316,51 @@ import path from 'node:path';
 const { loadAuthSetup } = await import(${JSON.stringify(path.join(repoRoot, 'dist', 'auth-setup.js'))});
 const loaded = await loadAuthSetup('login.ts#login', ${JSON.stringify(dir)});
 await loaded.fn(null);
+// A new phrasing inside a known family must be filtered; a user-code
+// warning must pass through verbatim.
+process.emitWarning('Could not parse the ES module at /fake/login.ts; it was loaded as CommonJS instead');
+process.emitWarning('fixture-side warning from user test code');
 await new Promise((r) => setTimeout(r, 300));
 `);
       const run = spawnSync(process.execPath, [path.join(dir, 'runner.mjs')], { encoding: 'utf8' });
       assert.equal(run.status, 0, `runner failed for ${pkg}: ${run.stderr}`);
-      for (const noise of ['ExperimentalWarning', 'Type Stripping', 'stripTypeScriptTypes', 'To load an ES module', 'MODULE_TYPELESS_PACKAGE_JSON']) {
+      for (const noise of ['ExperimentalWarning', 'Type Stripping', 'stripTypeScriptTypes', 'To load an ES module', 'MODULE_TYPELESS_PACKAGE_JSON', 'Could not parse the ES module']) {
         assert.ok(!run.stderr.includes(noise), `stderr must not contain "${noise}" for ${pkg}, got:\n${run.stderr}`);
       }
+      assert.ok(
+        run.stderr.includes('fixture-side warning from user test code'),
+        `user warning must pass through for ${pkg}, got:\n${run.stderr}`,
+      );
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   }
+});
+
+// 0.3.0: the noise filter classifies warnings by FAMILY (patterns), not
+// exact strings, so new phrasings of a known family are caught without a
+// code change — while anything outside the families passes untouched.
+test('loader-noise families match by pattern; user warnings pass through', () => {
+  // The three leak shapes seen so far, plus the typeless-reparse warning.
+  const seen = [
+    ['ExperimentalWarning', 'stripTypeScriptTypes is an experimental feature and might change at any time', undefined],
+    ['ExperimentalWarning', 'Type Stripping is an experimental feature and might change at any time', undefined],
+    ['Warning', 'To load an ES module, set "type": "module" in the package.json or use the .mjs extension.', undefined],
+    ['Warning', 'Failed to load the ES module: /repo/utils/login.ts. Make sure to set "type": "module" in the nearest package.json file or use the .mjs extension.', undefined],
+    ['Warning', 'Module /repo/login.ts was reparsed as an ES module because module syntax was detected', 'MODULE_TYPELESS_PACKAGE_JSON'],
+  ];
+  for (const [name, msg, code] of seen) {
+    assert.ok(isLoaderNoise(name, msg, code), `should filter: ${msg}`);
+  }
+  // A fabricated FOURTH phrasing inside a known family still matches.
+  assert.ok(isLoaderNoise('Warning', 'Could not parse the ES module at /repo/login.ts; it was loaded as CommonJS instead'));
+  assert.ok(isLoaderNoise('ExperimentalWarning', 'Module customization hooks are an experimental feature'));
+  // Warnings from the user's own test code and fixtures pass verbatim:
+  // deprecations about THEIR APIs, custom warnings, non-module failures.
+  assert.ok(!isLoaderNoise('DeprecationWarning', 'loginHelper() is deprecated, use signIn() instead'));
+  assert.ok(!isLoaderNoise('Warning', 'fixture server responded slowly'));
+  assert.ok(!isLoaderNoise(undefined, 'Failed to load user preferences'));
+  assert.ok(!isLoaderNoise('ExperimentalWarning', 'the beta checkout flow is an experimental feature of this app'));
 });
 
 // 0.2.1 ITEM 6b: ':' as an alternative export separator (zsh-friendly),

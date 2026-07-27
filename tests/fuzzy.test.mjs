@@ -203,6 +203,35 @@ test('prefixes shorter than 4 normalized chars carry no signal', () => {
   assert.notEqual(r.kind, 'match');
 });
 
+// 0.3.0 field report (/classattr): pages that DISPLAY selector strings as
+// code samples must never see those strings become fuzzy candidates — a
+// selector names how to FIND an element, not what an element is.
+test('selector-shaped page text is never a candidate, a match, or named', () => {
+  const r = matchFuzzy('Button', [
+    { display: '"//button[@class=\'btn-primary\']"', values: ["//button[@class='btn-primary']"], attrOf: { "//button[@class='btn-primary']": 'text' } },
+    { display: '"//button[contains(concat(\' \', normalize-space(@class), \' \'), \' btn-primary \')]"', values: ["//button[contains(concat(' ', normalize-space(@class), ' '), ' btn-primary ')]"], attrOf: {} },
+    { display: '".btn-primary"', values: ['.btn-primary'], attrOf: { '.btn-primary': 'text' } },
+  ]);
+  assert.equal(r.kind, 'none');
+});
+
+test('prose containing the token as one word among many is not identity', () => {
+  // Leaf TEXT needs real word coverage, like ids — only genuine
+  // accessible-name sources (aria-label, label, placeholder) keep the
+  // relaxed whole-word rule.
+  const r = matchFuzzy('Button', [
+    { display: '"Record primary (blue) button click and press ok in alert popup."', values: ['Record primary (blue) button click and press ok in alert popup.'], attrOf: { 'Record primary (blue) button click and press ok in alert popup.': 'text' } },
+  ]);
+  assert.notEqual(r.kind, 'match');
+});
+
+test('short leaf text equal to the identifier still matches', () => {
+  const r = matchFuzzy('Button', [
+    { display: '"Button"', values: ['Button'], attrOf: { Button: 'text' } },
+  ]);
+  assert.equal(r.kind, 'match');
+});
+
 test('nothing similar at all yields none', () => {
   const r = matchFuzzy('result', [
     el('#register-button', 'register-button'),

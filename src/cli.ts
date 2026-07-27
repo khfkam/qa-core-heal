@@ -1,14 +1,16 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
 import readline from 'node:readline/promises';
-import { heal, type HealEvent, type HealResult, type HealTarget, type LocatorReport } from './heal.js';
+import { parseArgs } from 'node:util';
+import { createRequire } from 'node:module';
+import { applyHealPlan, applyHealPlanExcluding, collectSpecFiles, heal, selectorSignature, type HealEvent, type HealResult, type HealTarget, type LocatorReport } from './heal.js';
 import { escapeRegex, type CascadeLevel } from './selectors.js';
 import { loadConfig } from './config.js';
 import { appendAuditLog, type AuditEntry } from './audit.js';
 import { findPlaywrightConfig, supportsTypeStripping, typeStrippingGateMessage } from './playwright-config.js';
 import { classifyFailure, collectTests, parseConsent, parseJsonReport, traceFailureUrl, type TestOutcome } from './run.js';
+import { describeFailedRun, runPlaywrightCli } from './playwright-cli.js';
 
 /**
  * qa-core-heal CLI.
@@ -112,73 +114,165 @@ interface CliArgs {
   auditLog?: string;
   maxHeals?: number;
   verify?: boolean;
+  help: boolean;
+  version: boolean;
+  /** --verbose, or implied by --debug. */
+  verbose: boolean;
+  debug: boolean;
+  output?: string;
+  /** --no-color flag, or the NO_COLOR env var. Output is colorless today;
+   *  the flag is honored so that never silently changes. */
+  noColor: boolean;
 }
 
+/**
+ * Detected before parsing so even a parse-time failure can honor the
+ * machine-readable contract: with --json anywhere on the argv, errors go
+ * to stdout as valid JSON (the human message stays on stderr).
+ */
+const jsonErrorMode = process.argv.includes('--json');
+
 function fail(msg: string): never {
+  if (jsonErrorMode) {
+    console.log(JSON.stringify({
+      schemaVersion: 1,
+      error: msg,
+      verdicts: [],
+      summary: { heals: 0, refusals: 0, nonLocator: 0, errors: 1 },
+    }, null, 2));
+  }
   console.error(msg);
   process.exit(1);
 }
 
+const HELP = `qa-core-heal — deterministic selector healing for Playwright specs
+
+Usage:
+  qa-core-heal [spec-path] [flags]
+
+Example:
+  qa-core-heal tests/checkout.spec.ts --dry-run
+
+Flags:
+  -h, --help                     show this help and exit
+  -v, --version                  print the version and exit
+      --scan                     static probe: every locator on its inferred route, no test execution
+      --dry-run                  classify and propose heals, print the exact diff, write nothing, skip the verify re-run
+      --apply                    write approved heals to source files (always previews the diff first)
+  -y, --yes                      auto-approve the apply prompt for EVIDENCE-BASED HEALS ONLY. This flag
+                                 will never cover suggestion-level changes; those will require a separate
+                                 --accept-suggestions (future).
+      --json                     machine-readable result on stdout (schemaVersion 1) instead of human text
+      --output <path>            additionally write the human run report to the given file; stdout unchanged
+      --verbose                  detailed progress: probe steps, candidate scoring, child commands executed
+      --debug                    implies --verbose; adds stack traces and raw child stdout/stderr
+      --config <file>            use this config file instead of the default qa-core.config.json lookup
+      --base-url <url>           base URL of the app under test (overrides config and playwright.config)
+      --project <name>           playwright project to take use.baseURL from when projects disagree
+      --route <file>=<route>     override the inferred route for a spec or page-object file (repeatable)
+      --storage-state <path>     probe with a saved Playwright session
+      --auth-setup <file>#<fn>   run your own login function before probing (file:fn also works)
+      --auth-setup-timeout <s>   seconds before a hanging auth setup fails the run (default 60)
+      --settle-ms <ms>           cap on the mutation-quiet settle before candidate collection (default 2000)
+      --max-heals <n>            refuse any heal beyond the first n
+      --verify / --no-verify     re-run previously failing tests after applying (default on)
+      --no-trace                 skip Playwright tracing; failure URLs come from route inference
+      --audit-log <path>         append applied heals to this JSONL file
+      --no-color                 disable ANSI colors (the NO_COLOR env var is honored automatically)
+
+Exit codes: 0 success · 1 error, or a heal was reverted because its
+verify re-run still failed · 2 heals available but not applied.
+`;
+
 function parseCliArgs(argv: string[]): CliArgs {
-  const args = argv.slice(2);
-  const out: CliArgs = { scan: false, noTrace: false, dryRun: false, apply: false, yes: false, json: false, routeOverrides: [] };
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i]!;
-    if (a === '--scan') out.scan = true;
-    else if (a === '--no-trace') out.noTrace = true;
-    else if (a === '--config') out.configPath = args[++i];
-    else if (a === '--base-url') out.baseUrl = args[++i];
-    else if (a === '--project') out.project = args[++i];
-    else if (a === '--storage-state') out.storageState = args[++i];
-    else if (a === '--auth-setup') out.authSetup = args[++i];
-    else if (a === '--auth-setup-timeout') {
-      const s = Number(args[++i]);
-      if (!Number.isFinite(s) || s <= 0) fail('--auth-setup-timeout expects a positive number of seconds.');
-      out.authSetupTimeout = s * 1000;
-    }
-    else if (a === '--settle-ms') {
-      const n = Number(args[++i]);
-      if (!Number.isFinite(n) || n < 0) fail('--settle-ms expects a non-negative number of milliseconds.');
-      out.settleMs = n;
-    }
-    else if (a === '--route') {
-      const v = args[++i];
-      const eq = v?.indexOf('=') ?? -1;
-      if (!v || eq <= 0) fail('--route expects <file>=<route>, e.g. --route pages/login-page.ts=/login');
-      out.routeOverrides.push({ file: v.slice(0, eq), route: v.slice(eq + 1) });
-    }
-    else if (a === '--dry-run') out.dryRun = true;
-    else if (a === '--apply') out.apply = true;
-    else if (a === '--yes' || a === '-y') out.yes = true;
-    else if (a === '--json') out.json = true;
-    else if (a === '--audit-log') out.auditLog = args[++i];
-    else if (a === '--max-heals') {
-      const n = Number(args[++i]);
-      if (!Number.isInteger(n) || n < 0) fail('--max-heals expects a non-negative integer.');
-      out.maxHeals = n;
-    } else if (a === '--verify') out.verify = true;
-    else if (a === '--no-verify') out.verify = false;
-    else if (!a.startsWith('--') && !out.specPath) out.specPath = a;
-    else fail(`Unknown argument: ${a}`);
+  let values: Record<string, unknown>;
+  let positionals: string[];
+  try {
+    ({ values, positionals } = parseArgs({
+      args: argv.slice(2),
+      allowPositionals: true,
+      strict: true,
+      options: {
+        help: { type: 'boolean', short: 'h' },
+        version: { type: 'boolean', short: 'v' },
+        scan: { type: 'boolean' },
+        'no-trace': { type: 'boolean' },
+        config: { type: 'string' },
+        'base-url': { type: 'string' },
+        project: { type: 'string' },
+        'storage-state': { type: 'string' },
+        'auth-setup': { type: 'string' },
+        'auth-setup-timeout': { type: 'string' },
+        'settle-ms': { type: 'string' },
+        route: { type: 'string', multiple: true },
+        'dry-run': { type: 'boolean' },
+        apply: { type: 'boolean' },
+        yes: { type: 'boolean', short: 'y' },
+        json: { type: 'boolean' },
+        'audit-log': { type: 'string' },
+        'max-heals': { type: 'string' },
+        verify: { type: 'boolean' },
+        'no-verify': { type: 'boolean' },
+        verbose: { type: 'boolean' },
+        debug: { type: 'boolean' },
+        output: { type: 'string' },
+        'no-color': { type: 'boolean' },
+      },
+    }));
+  } catch (e) {
+    // parseArgs appends a long positional-escaping hint; the first
+    // sentence carries the actual problem.
+    const first = (e as Error).message.split(/\.\s/)[0]!.replace(/\.$/, '');
+    fail(`${first}. Run qa-core-heal --help for usage.`);
   }
+  const v = values as Record<string, string | boolean | string[] | undefined>;
+  const out: CliArgs = {
+    scan: v.scan === true,
+    noTrace: v['no-trace'] === true,
+    dryRun: v['dry-run'] === true,
+    apply: v.apply === true,
+    yes: v.yes === true,
+    json: v.json === true,
+    routeOverrides: [],
+    help: v.help === true,
+    version: v.version === true,
+    debug: v.debug === true,
+    verbose: v.verbose === true || v.debug === true,
+    noColor: v['no-color'] === true || (process.env.NO_COLOR ?? '') !== '',
+  };
+  out.configPath = v.config as string | undefined;
+  out.baseUrl = v['base-url'] as string | undefined;
+  out.project = v.project as string | undefined;
+  out.storageState = v['storage-state'] as string | undefined;
+  out.authSetup = v['auth-setup'] as string | undefined;
+  out.auditLog = v['audit-log'] as string | undefined;
+  out.output = v.output as string | undefined;
+  if (v['auth-setup-timeout'] !== undefined) {
+    const s = Number(v['auth-setup-timeout']);
+    if (!Number.isFinite(s) || s <= 0) fail('--auth-setup-timeout expects a positive number of seconds.');
+    out.authSetupTimeout = s * 1000;
+  }
+  if (v['settle-ms'] !== undefined) {
+    const n = Number(v['settle-ms']);
+    if (!Number.isFinite(n) || n < 0) fail('--settle-ms expects a non-negative number of milliseconds.');
+    out.settleMs = n;
+  }
+  for (const r of (v.route as string[] | undefined) ?? []) {
+    const eq = r.indexOf('=');
+    if (eq <= 0) fail('--route expects <file>=<route>, e.g. --route pages/login-page.ts=/login');
+    out.routeOverrides.push({ file: r.slice(0, eq), route: r.slice(eq + 1) });
+  }
+  if (v['max-heals'] !== undefined) {
+    const n = Number(v['max-heals']);
+    if (!Number.isInteger(n) || n < 0) fail('--max-heals expects a non-negative integer.');
+    out.maxHeals = n;
+  }
+  if (v['no-verify'] === true) out.verify = false;
+  else if (v.verify === true) out.verify = true;
+  out.specPath = positionals[0];
+  if (positionals.length > 1) fail(`Unknown argument: ${positionals[1]}`);
   if (out.dryRun && out.apply) fail('Pass either --dry-run or --apply, not both.');
   return out;
-}
-
-/** Every *.spec.ts / *.spec.js under dir, recursive, sorted for determinism. */
-function findSpecs(testDir: string): string[] {
-  const out: string[] = [];
-  const walk = (d: string): void => {
-    let entries: fs.Dirent[];
-    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
-    for (const e of entries) {
-      const p = path.join(d, e.name);
-      if (e.isDirectory()) walk(p);
-      else if (/\.spec\.(ts|js)$/.test(e.name)) out.push(p);
-    }
-  };
-  walk(testDir);
-  return out.sort();
 }
 
 /**
@@ -208,6 +302,49 @@ async function confirmApply(cli: CliArgs, count: number): Promise<boolean> {
   return false;
 }
 
+/** One row of the schemaVersion-1 verdicts array (see README contract). */
+interface Verdict {
+  spec: string;
+  testTitle: string | null;
+  classification: 'locator' | 'non-locator';
+  message: string | null;
+  healApplied: boolean;
+  before: string | null;
+  after: string | null;
+  verified: boolean | null;
+  /** The heal was applied but undone: its verify re-run still failed. */
+  reverted: boolean;
+}
+
+function locatorVerdict(
+  l: LocatorReport,
+  applied: boolean,
+  testTitle: string | null,
+  verified: boolean | null,
+): Verdict {
+  return {
+    spec: l.file,
+    testTitle,
+    classification: 'locator',
+    message: l.reason ?? (l.status === 'intact' ? 'intact' : null),
+    healApplied: l.status === 'healed' && applied,
+    before: l.old,
+    after: l.status === 'healed' ? l.new : null,
+    verified: l.status === 'healed' ? verified : null,
+    reverted: false,
+  };
+}
+
+/** --verbose/--debug reporting around child Playwright runs. Extra lines
+ *  only, on stderr — verdicts and messages stay untouched. */
+function logChildRun(cli: CliArgs, run: ReturnType<typeof runPlaywrightCli>): void {
+  if (cli.verbose) console.error(`[verbose] child: ${run.command} (exit ${run.status ?? 'spawn-error'})`);
+  if (cli.debug) {
+    if (run.stdout) console.error(`[debug] child stdout:\n${run.stdout}`);
+    if (run.stderr) console.error(`[debug] child stderr:\n${run.stderr}`);
+  }
+}
+
 /** Nearest directory at or above the spec that holds a package.json. */
 function projectRootFor(specPath: string): string {
   let dir = path.dirname(specPath);
@@ -221,14 +358,38 @@ function projectRootFor(specPath: string): string {
 
 async function main(): Promise<void> {
   const cli = parseCliArgs(process.argv);
+  if (cli.help) {
+    console.log(HELP);
+    return;
+  }
+  if (cli.version) {
+    const pkg = createRequire(import.meta.url)('../package.json') as { version: string };
+    console.log(pkg.version);
+    return;
+  }
   const loaded = loadConfig(cli.configPath);
   const cfg = loaded?.config ?? {};
   const cfgDir = loaded?.dir ?? process.cwd();
   const fromCfg = (p: string): string => path.resolve(cfgDir, p);
 
+  // A DIRECTORY target is walked for spec files, never read as a file:
+  // "qa-core-heal tests/systematic" used to push the directory itself into
+  // readFileSync and die with a bare EISDIR.
+  const verboseNote = cli.verbose ? (line: string): void => console.error(line) : undefined;
   let specs: string[] = [];
-  if (cli.specPath) specs = [path.resolve(cli.specPath)];
-  else if (cfg.testDir) specs = findSpecs(fromCfg(cfg.testDir));
+  if (cli.specPath) {
+    const target = path.resolve(cli.specPath);
+    if (fs.existsSync(target) && fs.statSync(target).isDirectory()) {
+      specs = collectSpecFiles(target, verboseNote);
+      if (specs.length === 0) {
+        fail(`No spec files (*.spec.ts/js, *.test.ts/js) found under directory: ${target}`);
+      }
+    } else {
+      specs = [target];
+    }
+  } else if (cfg.testDir) {
+    specs = collectSpecFiles(fromCfg(cfg.testDir), verboseNote);
+  }
   if (specs.length === 0) {
     fail('Usage: qa-core-heal <spec-path> [flags], or set testDir in qa-core.config.json.');
   }
@@ -269,7 +430,19 @@ async function main(): Promise<void> {
       ? fromCfg(cfg.audit.logPath)
       : path.resolve('.qa-core/heal-log.jsonl');
 
-  const say = (line: string): void => { if (!cli.json) console.log(line); };
+  // The human report, teed to --output when given; stdout is unchanged.
+  const reportLines: string[] = [];
+  const say = (line: string): void => {
+    if (cli.json) return;
+    console.log(line);
+    reportLines.push(line);
+  };
+  if (cli.output) {
+    const outPath = path.resolve(cli.output);
+    process.on('exit', () => {
+      try { fs.writeFileSync(outPath, reportLines.join('\n') + '\n'); } catch { /* best effort */ }
+    });
+  }
   // Per-locator lines are grouped under their source file, so a spec that
   // imports several page objects reads as one block per file. Fresh state
   // per pass: the current-file marker must reset between preview and apply.
@@ -304,6 +477,7 @@ async function main(): Promise<void> {
       authSetupTimeout: cli.authSetupTimeout,
       settleMs: cli.settleMs,
       routeOverrides: cli.routeOverrides.length > 0 ? cli.routeOverrides : undefined,
+      verbose: cli.verbose,
       onEvent: cli.json || !events ? undefined : makeEventPrinter(),
     });
   const sayHeader = (suffix: string): void => {
@@ -320,7 +494,11 @@ async function main(): Promise<void> {
       say('');
     }
   };
-  const writeAudit = (heals: HealResult['healed'], verifiedFor: (h: HealResult['healed'][number]) => boolean): void => {
+  const writeAudit = (
+    heals: HealResult['healed'],
+    verifiedFor: (h: HealResult['healed'][number]) => boolean,
+    revertedFor: (h: HealResult['healed'][number]) => boolean = () => false,
+  ): void => {
     const auditEntries: AuditEntry[] = heals.map((h) => ({
       timestamp: new Date().toISOString(),
       file: path.relative(process.cwd(), h.file).split(path.sep).join('/'),
@@ -329,7 +507,10 @@ async function main(): Promise<void> {
       new: h.new,
       level: h.level,
       ambiguous: false,
+      // The heal WAS written; a revert does not erase that history.
+      applied: true,
       verified: verifiedFor(h),
+      reverted: revertedFor(h),
     }));
     if (auditEntries.length > 0) {
       appendAuditLog(auditPath, auditEntries);
@@ -350,6 +531,14 @@ async function main(): Promise<void> {
   if (!write) {
     sayHeader('  (dry run, no files written)');
     result = await runPass(false, true);
+    // The explicit --dry-run FLAG (not config dryRunByDefault, which must
+    // keep today's byte-identical output) also prints the exact would-be
+    // diff and states its own contract.
+    if (cli.dryRun) {
+      const proposed = result.locators.filter((l) => l.status === 'healed');
+      if (proposed.length > 0) printDiff(proposed);
+      say('dry run: no files changed, heal not verified');
+    }
   } else {
     // Applying always previews first: probe everything without writing —
     // printing the same per-locator detail as dry-run — then show the full
@@ -373,7 +562,15 @@ async function main(): Promise<void> {
       const confirmed = await confirmApply(cli, proposed.length);
       if (confirmed) {
         say('▸ Applying heals');
-        result = await runPass(true, false);
+        // Apply the PREVIEWED plan, never a re-probe: consent (--yes or
+        // the prompt) can only ever gate this write. A second probe could
+        // reach a different verdict than the diff the user just approved.
+        const written = applyHealPlan(preview.plan);
+        result = {
+          ...preview,
+          filesWritten: written,
+          healedPath: specs.find((sp) => written.includes(sp)) ?? written[0] ?? null,
+        };
         applied = true;
       } else {
         // Declined at the prompt, or non-interactive without --yes: the
@@ -386,6 +583,9 @@ async function main(): Promise<void> {
     }
   }
   const locators = result.locators;
+  // Heals reverted after a failed per-spec verify, keyed "file|line" (the
+  // report-relative file), for the JSON verdicts.
+  const scanRevertedKeys = new Set<string>();
 
   // Audit log entries are written only when heals were actually applied.
   if (applied && result.healed.length > 0) {
@@ -401,22 +601,46 @@ async function main(): Promise<void> {
         const root = projectRootFor(spec);
         const rel = path.relative(root, spec);
         say(`▸ Verifying ${rel} with a re-run`);
-        const run = spawnSync('npx', ['playwright', 'test', rel], {
-          cwd: root, encoding: 'utf8', shell: process.platform === 'win32',
-        });
+        const run = runPlaywrightCli(root, ['test', rel], 32 * 1024 * 1024);
+        logChildRun(cli, run);
         verifiedBySpec.set(spec, run.status === 0);
         say(run.status === 0 ? '  ✓ re-run passed' : '  ✗ re-run FAILED (audit entries record verified=false)');
+      }
+    }
+    // Revert contract (scan-mode granularity: PER SPEC — without test
+    // execution there is no per-test signal, so a heal is reverted when
+    // ANY spec that owns its file still fails after applying). The audit
+    // keeps the full history: applied:true, verified:false, reverted:true.
+    const revertedHeals = new Set<HealResult['healed'][number]>();
+    if (verify) {
+      for (const h of result.healed) {
+        const owners = specs.filter((sp) => (result.specFiles[sp] ?? []).includes(h.file));
+        if (owners.some((sp) => verifiedBySpec.get(sp) === false)) revertedHeals.add(h);
+      }
+      if (revertedHeals.size > 0) {
+        applyHealPlanExcluding(result.plan, (file, edit) =>
+          [...revertedHeals].some((h) => h.file === file && h.line === edit.line && h.new === edit.newRaw));
+        for (const h of revertedHeals) {
+          const rel = path.relative(process.cwd(), h.file).split(path.sep).join('/');
+          scanRevertedKeys.add(`${rel}|${h.line}`);
+          say(`✗ heal reverted: re-run still failing after heal — ${rel}:${h.line} ${h.old}`);
+        }
+        say(`${revertedHeals.size} heal(s) reverted: re-run still failing after heal`);
+        process.exitCode = 1;
       }
     }
     writeAudit(result.healed, (h) => {
       const owners = specs.filter((sp) => (result.specFiles[sp] ?? []).includes(h.file));
       return verify && owners.length > 0 && owners.every((sp) => verifiedBySpec.get(sp) === true);
-    });
+    }, (h) => revertedHeals.has(h));
   }
 
   if (cli.json) {
     const count = (s: LocatorReport['status']): number => locators.filter((l) => l.status === s).length;
     const payload = {
+      // schemaVersion 1 is the compatibility contract (see README); the
+      // legacy keys below it are kept verbatim for existing consumers.
+      schemaVersion: 1,
       // True whenever this run wrote no files (dry-run, nothing to heal,
       // or heals available but not confirmed).
       dryRun: !applied,
@@ -425,11 +649,20 @@ async function main(): Promise<void> {
       intact: count('intact'),
       refused: count('refused'),
       locators,
+      verdicts: locators.map((l) => {
+        const reverted = scanRevertedKeys.has(`${l.file}|${l.line}`);
+        return { ...locatorVerdict(l, applied, null, reverted ? false : null), reverted };
+      }),
+      summary: { heals: count('healed'), refusals: count('refused'), nonLocator: 0, errors: result.fileErrors.length },
+      fileErrors: result.fileErrors,
     };
     console.log(JSON.stringify(payload, null, 2));
   } else {
     const count = (s: LocatorReport['status']): number => locators.filter((l) => l.status === s).length;
     say(`Done. ${count('intact')} intact · ${count('healed')} healed · ${count('refused')} refused (${locators.length} locators across ${specs.length} spec file(s)).`);
+    if (result.fileErrors.length > 0) {
+      say(`${result.fileErrors.length} locator(s) skipped due to file errors`);
+    }
   }
 }
 
@@ -441,7 +674,11 @@ interface RunFirstCtx {
   say: (line: string) => void;
   runPass: (writePass: boolean, events: boolean, targets?: HealTarget[]) => Promise<HealResult>;
   printDiff: (proposed: LocatorReport[]) => void;
-  writeAudit: (heals: HealResult['healed'], verifiedFor: (h: HealResult['healed'][number]) => boolean) => void;
+  writeAudit: (
+    heals: HealResult['healed'],
+    verifiedFor: (h: HealResult['healed'][number]) => boolean,
+    revertedFor?: (h: HealResult['healed'][number]) => boolean,
+  ) => void;
 }
 
 /**
@@ -458,12 +695,15 @@ async function runFirstFlow(ctx: RunFirstCtx): Promise<void> {
   // browser launches, older Playwright); failure URLs then come from static
   // route inference, or the locator is refused when no route is knowable.
   const traceArgs = cli.noTrace ? [] : ['--trace', 'retain-on-failure'];
-  const run = spawnSync('npx', ['playwright', 'test', ...rels, '--reporter=json', ...traceArgs], {
-    cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, shell: process.platform === 'win32',
-  });
+  const run = runPlaywrightCli(root, ['test', ...rels, '--reporter=json', ...traceArgs], 64 * 1024 * 1024);
+  logChildRun(cli, run);
   const report = parseJsonReport(run.stdout ?? '') as { config?: { rootDir?: string } } | null;
   if (!report) {
-    fail(`Could not run the Playwright tests (no JSON report). ${String(run.stderr ?? '').split('\n')[0] ?? ''}`);
+    // The child's failure story travels whole: the exact command, the
+    // spawn error code or exit status, and the stderr tail. A bare
+    // "could not run" would leave a Windows ENOENT indistinguishable
+    // from a broken config.
+    fail(`Could not run the Playwright tests (no JSON report). ${describeFailedRun(run)}`);
   }
   const tests = collectTests(report as Parameters<typeof collectTests>[0]);
   if (tests.length === 0) {
@@ -471,16 +711,58 @@ async function runFirstFlow(ctx: RunFirstCtx): Promise<void> {
   }
   const failing = tests.filter((t) => !t.ok);
 
+  // Declared before emit(): the all-green path emits with these still
+  // empty, and emit's title lookup closes over `targets`.
+  const targets: HealTarget[] = [];
+  const locatorTests: TestOutcome[] = [];
+  const nonLocator: Array<{ test: string; reason: string; file?: string }> = [];
+  // Heals reverted because their test still failed after applying,
+  // keyed "file|line" — feeds the verdicts and the audit.
+  const revertedKeys = new Set<string>();
+  // Test titles for locator verdicts and per-test verification, matched
+  // structurally (the same signature the healer uses).
+  const titleFor = (old: string): string | null => {
+    const sig = selectorSignature(old.replace(/^(?:this\.)?page\./, ''));
+    if (!sig) return null;
+    for (const t of targets) {
+      if (t.test && selectorSignature(t.selector) === sig) return t.test;
+    }
+    return null;
+  };
+
   const emit = (
     result: HealResult | null,
     applied: boolean,
-    nonLocator: Array<{ test: string; reason: string }>,
+    nonLocator: Array<{ test: string; reason: string; file?: string }>,
     unmatchedTargets: HealTarget[] = [],
+    rerunPassed: boolean | null = null,
   ): void => {
     const locators = result?.locators ?? [];
     const count = (s: LocatorReport['status']): number => locators.filter((l) => l.status === s).length;
     if (cli.json) {
+      const verdicts: Verdict[] = [
+        ...locators.map((l) => {
+          const reverted = revertedKeys.has(`${l.file}|${l.line}`);
+          const v = locatorVerdict(
+            l, applied, titleFor(l.old),
+            reverted ? false : (applied && verify ? rerunPassed : null),
+          );
+          return { ...v, reverted };
+        }),
+        ...nonLocator.map((n) => ({
+          spec: n.file ?? '',
+          testTitle: n.test,
+          classification: 'non-locator' as const,
+          message: n.reason,
+          healApplied: false,
+          before: null,
+          after: null,
+          verified: null,
+          reverted: false,
+        })),
+      ];
       console.log(JSON.stringify({
+        schemaVersion: 1,
         dryRun: !applied,
         scanned: locators.length,
         healed: count('healed'),
@@ -489,6 +771,14 @@ async function runFirstFlow(ctx: RunFirstCtx): Promise<void> {
         locators,
         nonLocatorFailures: nonLocator,
         unmatchedFailures: unmatchedTargets.map((u) => ({ selector: u.selector, test: u.test ?? null })),
+        verdicts,
+        summary: {
+          heals: count('healed'),
+          refusals: count('refused'),
+          nonLocator: nonLocator.length,
+          errors: unmatchedTargets.length + (result?.fileErrors.length ?? 0),
+        },
+        fileErrors: result?.fileErrors ?? [],
       }, null, 2));
     } else if (result) {
       const skipped = nonLocator.length > 0 ? ` · ${nonLocator.length} non-locator failure(s) skipped` : '';
@@ -505,9 +795,6 @@ async function runFirstFlow(ctx: RunFirstCtx): Promise<void> {
 
   // 2. Classify each failure: only locator failures are heal candidates.
   say(`  ${failing.length} of ${tests.length} test(s) failing\n`);
-  const targets: HealTarget[] = [];
-  const locatorTests: TestOutcome[] = [];
-  const nonLocator: Array<{ test: string; reason: string }> = [];
   for (const t of failing) {
     const c = classifyFailure(t.message);
     if (c.kind === 'locator' && c.selector) {
@@ -523,7 +810,7 @@ async function runFirstFlow(ctx: RunFirstCtx): Promise<void> {
       say(`  → ${t.title} — locator failure: ${c.selector}${url ? `  (page: ${url})` : ''}`);
     } else {
       const reason = c.kind === 'other' ? c.summary : 'locator failure, but the selector could not be extracted';
-      nonLocator.push({ test: t.title, reason });
+      nonLocator.push({ test: t.title, reason, file: t.file });
       say(`  ✗ ${t.title} — not a locator problem, healing won't fix this\n      ${reason}`);
     }
   }
@@ -538,8 +825,13 @@ async function runFirstFlow(ctx: RunFirstCtx): Promise<void> {
   const preview = await runPass(false, true, targets);
   // A failing locator we could not find in the source is OUR bug, not a
   // clean bill of health: name it loudly and exit non-zero. Never print
-  // "Nothing to heal" while these exist.
-  const unmatched = preview.unmatchedTargets;
+  // "Nothing to heal" while these exist. EXCEPT: a target whose source
+  // file could not be read at all was already reported as a file error —
+  // that is a skipped locator, not a matching bug.
+  const erroredFiles = new Set(preview.fileErrors.map((f) => path.resolve(f.path)));
+  const fileSkipped = preview.unmatchedTargets.filter((u) =>
+    u.locations?.some((l) => erroredFiles.has(path.resolve(l.file))));
+  const unmatched = preview.unmatchedTargets.filter((u) => !fileSkipped.includes(u));
   if (unmatched.length > 0) {
     say('');
     for (const u of unmatched) {
@@ -549,6 +841,12 @@ async function runFirstFlow(ctx: RunFirstCtx): Promise<void> {
   let result = preview;
   let applied = false;
   const proposed = preview.locators.filter((l) => l.status === 'healed');
+  // The explicit --dry-run FLAG also prints the exact would-be diff and
+  // states its own contract; refusals above are identical to normal mode.
+  if (!write && cli.dryRun) {
+    if (proposed.length > 0) printDiff(proposed);
+    say('dry run: no files changed, heal not verified');
+  }
   if (write && proposed.length === 0) {
     if (unmatched.length === 0) say('Nothing to heal. No files written.');
   } else if (write) {
@@ -556,7 +854,15 @@ async function runFirstFlow(ctx: RunFirstCtx): Promise<void> {
     const confirmed = await confirmApply(cli, proposed.length);
     if (confirmed) {
       say('▸ Applying heals');
-      result = await runPass(true, false, targets);
+      // Apply the PREVIEWED plan, never a re-probe (see scan mode above):
+      // --yes only skips the prompt, and the diff that lands is byte-for-
+      // byte the diff that was shown.
+      const written = applyHealPlan(preview.plan);
+      result = {
+        ...preview,
+        filesWritten: written,
+        healedPath: specs.find((sp) => written.includes(sp)) ?? written[0] ?? null,
+      };
       applied = true;
     } else {
       say('Heals available but not applied. No files written. Pass --yes (or -y) to apply without prompting.');
@@ -565,28 +871,84 @@ async function runFirstFlow(ctx: RunFirstCtx): Promise<void> {
   }
 
   // 4. Verify by re-running ONLY the previously failing locator tests.
+  //    Contract: a heal whose test STILL fails after applying is REVERTED
+  //    — run-mode granularity is PER TEST: when the combined re-run
+  //    fails, each previously failing test is re-run individually and
+  //    only the heals whose tests still fail are undone; heals whose
+  //    tests now pass stay, individually verified.
   let rerunPassed: boolean | null = null;
+  const verifiedByTitle = new Map<string, boolean>();
   if (applied && verify && result.healed.length > 0) {
     const rootDir = report.config?.rootDir ?? root;
-    const fileArgs = [...new Set(locatorTests.map((t) => path.relative(root, path.resolve(rootDir, t.file))))];
+    const fileArgOf = (t: TestOutcome): string => path.relative(root, path.resolve(rootDir, t.file));
+    const fileArgs = [...new Set(locatorTests.map(fileArgOf))];
     const grep = locatorTests.map((t) => escapeRegex(t.title)).join('|');
     say(`▸ Verifying: re-running ${locatorTests.length} previously failing test(s)`);
-    const rerun = spawnSync('npx', ['playwright', 'test', ...fileArgs, '--grep', grep], {
-      cwd: root, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, shell: process.platform === 'win32',
-    });
+    // The grep pattern joins titles with '|': under a Windows shell that
+    // would be a cmd.exe pipe — runPlaywrightCli passes argv verbatim.
+    const rerun = runPlaywrightCli(root, ['test', ...fileArgs, '--grep', grep], 32 * 1024 * 1024);
+    logChildRun(cli, rerun);
     rerunPassed = rerun.status === 0;
-    say(rerunPassed ? '  ✓ re-run passed' : '  ✗ re-run FAILED (audit entries record verified=false)');
+    if (rerunPassed) {
+      say('  ✓ re-run passed');
+      for (const t of locatorTests) verifiedByTitle.set(t.title, true);
+    } else {
+      say('  ✗ re-run FAILED — verifying per test to isolate the failing heal(s)');
+      for (const t of locatorTests) {
+        const one = runPlaywrightCli(root, ['test', fileArgOf(t), '--grep', escapeRegex(t.title)], 32 * 1024 * 1024);
+        logChildRun(cli, one);
+        verifiedByTitle.set(t.title, one.status === 0);
+      }
+      const revertedHeals = new Set<HealResult['healed'][number]>();
+      for (const h of result.healed) {
+        const title = titleFor(h.old);
+        // Unmappable heals are reverted too: without a test to vouch for
+        // the heal, a failed combined re-run leaves it unverified.
+        if (!title || verifiedByTitle.get(title) !== true) revertedHeals.add(h);
+      }
+      if (revertedHeals.size > 0) {
+        applyHealPlanExcluding(result.plan, (file, edit) =>
+          [...revertedHeals].some((h) => h.file === file && h.line === edit.line && h.new === edit.newRaw));
+        for (const h of revertedHeals) {
+          const rel = path.relative(process.cwd(), h.file).split(path.sep).join('/');
+          revertedKeys.add(`${rel}|${h.line}`);
+          say(`  ✗ heal reverted: re-run still failing after heal — ${rel}:${h.line} ${h.old}`);
+        }
+        say(`${revertedHeals.size} heal(s) reverted: re-run still failing after heal`);
+        process.exitCode = 1;
+      }
+    }
   }
   if (applied && result.healed.length > 0) {
-    writeAudit(result.healed, () => verify && rerunPassed === true);
+    const relOf = (h: HealResult['healed'][number]): string =>
+      path.relative(process.cwd(), h.file).split(path.sep).join('/');
+    writeAudit(
+      result.healed,
+      (h) => {
+        if (!verify) return false;
+        if (rerunPassed === true) return true;
+        const title = titleFor(h.old);
+        return title != null && verifiedByTitle.get(title) === true;
+      },
+      (h) => revertedKeys.has(`${relOf(h)}|${h.line}`),
+    );
   }
-  emit(result, applied, nonLocator, unmatched);
+  emit(result, applied, nonLocator, unmatched, rerunPassed);
+  // The final skip summary: precise (per-target) when targets could be
+  // attributed to errored files, else one per unreadable file.
+  if (result.fileErrors.length > 0) {
+    say(`${fileSkipped.length > 0 ? fileSkipped.length : result.fileErrors.length} locator(s) skipped due to file errors`);
+  }
   // Unmatched targets are a bug in heal's matching, not a user mistake:
   // exit 1 (takes precedence over the not-applied exit 2).
   if (unmatched.length > 0) process.exitCode = 1;
 }
 
 main().catch((err: unknown) => {
-  console.error(err instanceof Error ? err.message : String(err));
-  process.exit(1);
+  // --debug adds the stack; --json keeps stdout a single valid JSON object
+  // carrying the failure story (fail() handles both for explicit exits).
+  if (process.argv.includes('--debug') && err instanceof Error && err.stack) {
+    console.error(err.stack);
+  }
+  fail(err instanceof Error ? err.message : String(err));
 });

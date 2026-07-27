@@ -36,12 +36,54 @@ function describeError(e: unknown): string {
 }
 
 /**
+ * Family classifier for loader noise. Three families, matched by PATTERN
+ * rather than exact strings, so a new Node phrasing of the same family is
+ * caught without a code change each time (three phrasings seen so far:
+ * the Type Stripping / stripTypeScriptTypes experimental warnings, the
+ * "To load an ES module..." hint, and "Failed to load the ES module..."):
+ *
+ *   1. Module-load / ESM interop hints: the message must have an
+ *      "ES module" SUBJECT and a load/parse VERB (or carry the
+ *      typeless-package reparse code).
+ *   2. Experimental-feature notices about module machinery: the warning
+ *      type must be ExperimentalWarning AND the subject must be module
+ *      loading / type stripping.
+ *   3. Deprecation notices about module machinery: type
+ *      DeprecationWarning AND a module-machinery subject (loaders,
+ *      --experimental flags, require(esm), import assertions).
+ *
+ * Conservative by construction: everything else passes through
+ * untouched. Families 2 and 3 require BOTH the warning type and the
+ * module-machinery subject, so warnings originating from the user's own
+ * test code or fixtures — their deprecations ("loginHelper() is
+ * deprecated"), their custom warnings, their app's "experimental
+ * feature" notices — are never suppressed.
+ */
+export function isLoaderNoise(name: string | undefined, message: string, code?: string): boolean {
+  if (code === 'MODULE_TYPELESS_PACKAGE_JSON') return true;
+  // Family 1: an ES-module subject plus a load/parse verb, any phrasing.
+  if (/\bES modules?\b/i.test(message)
+    && /\b(?:load(?:ed|ing)?|parsed?|reparsed|module syntax|"type"\s*:\s*"module")\b/i.test(message)) {
+    return true;
+  }
+  // Family 2: experimental notices about module machinery only.
+  if (name === 'ExperimentalWarning'
+    && /type stripping|striptypescripttypes|\bmodules?\b|\bloaders?\b|\bimports?\b|\brequire\b|\btypescript\b/i.test(message)) {
+    return true;
+  }
+  // Family 3: deprecation notices about module machinery only.
+  if (name === 'DeprecationWarning'
+    && /\bloaders?\b|--experimental|module\s+customization|require\s*\(\s*esm\s*\)|\bimport\s+assertions?\b/i.test(message)) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * The config loader suppresses Node's TypeScript-loading noise by running
  * in a child process with --no-warnings; this loader is in-process (the
  * login function needs our live page), so the same warnings must be
- * filtered here. Drops ONLY the known loader noise — Type Stripping /
- * stripTypeScriptTypes experimental warnings, the typeless-package reparse
- * warning, and the "To load an ES module..." hint; everything else passes.
+ * filtered here, via the family classifier above.
  *
  * Two layers, both installed ONCE and left in place for the life of the
  * process — a restore-after-load window provably leaked on real repos:
@@ -57,24 +99,28 @@ let loaderNoiseFilterInstalled = false;
 function suppressLoaderNoise(): void {
   if (loaderNoiseFilterInstalled) return;
   loaderNoiseFilterInstalled = true;
-  const NOISE_MARK = /Type Stripping|stripTypeScriptTypes|To load an ES module|MODULE_TYPELESS_PACKAGE_JSON/i;
-  const isLoaderNoise = (message: string, code?: string): boolean =>
-    NOISE_MARK.test(message) || code === 'MODULE_TYPELESS_PACKAGE_JSON';
   const original = process.emitWarning.bind(process);
   const filtered: typeof process.emitWarning = (warning, ...rest) => {
     const message = typeof warning === 'string' ? warning : (warning as Error)?.message ?? '';
-    const opt = rest[0] as { code?: string } | string | undefined;
+    const opt = rest[0] as { code?: string; type?: string } | string | undefined;
     const code = (typeof opt === 'object' && opt ? opt.code : undefined)
       ?? (typeof rest[1] === 'string' ? rest[1] : undefined)
       ?? (warning as { code?: string })?.code;
-    if (isLoaderNoise(message, code)) return;
+    const name = (typeof opt === 'string' ? opt : (typeof opt === 'object' && opt ? opt.type : undefined))
+      ?? (warning instanceof Error ? warning.name : undefined);
+    if (isLoaderNoise(name, message, code)) return;
     (original as (...args: unknown[]) => void)(warning, ...rest);
   };
   process.emitWarning = filtered;
-  // Rendered warning lines from the hooks thread. Only whole lines that
-  // are unambiguously a noise warning are dropped, plus the
-  // "(Use `node --trace-warnings ...)" hint DIRECTLY following one.
-  const NOISE_LINE = /^\(node:\d+\) (?:\[[A-Z_]+\] )?(?:ExperimentalWarning|Warning): /;
+  // Rendered warning lines from the hooks thread: parse the
+  // "(node:pid) [CODE] Name: message" shape and ask the same classifier.
+  // Also dropped: the "(Use `node --trace-warnings ...)" hint DIRECTLY
+  // following a dropped line.
+  const WARNING_LINE = /^\(node:\d+\) (?:\[([A-Z_0-9]+)\] )?([A-Za-z]+): (.*)$/;
+  const lineIsNoise = (line: string): boolean => {
+    const m = line.match(WARNING_LINE);
+    return m != null && isLoaderNoise(m[2], m[3] ?? '', m[1]);
+  };
   const HINT_LINE = /^\(Use `node --trace-warnings/;
   let lastDropped = false;
   const origWrite = process.stderr.write.bind(process.stderr);
@@ -84,7 +130,7 @@ function suppressLoaderNoise(): void {
       : Buffer.isBuffer(chunk) ? chunk.toString('utf8') : null;
     if (text == null) return (origWrite as (...a: unknown[]) => boolean)(chunk, ...rest);
     const kept = text.split('\n').filter((line) => {
-      if (NOISE_LINE.test(line) && NOISE_MARK.test(line)) { lastDropped = true; return false; }
+      if (lineIsNoise(line)) { lastDropped = true; return false; }
       if (lastDropped && HINT_LINE.test(line)) return false;
       if (line.trim().length > 0) lastDropped = false;
       return true;

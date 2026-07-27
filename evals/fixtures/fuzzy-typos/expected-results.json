@@ -67,6 +67,26 @@
       "old": "page.locator('[name=\"search_field\"]')",
       "expect": "intact",
       "test": "searches the filtered catalog by prefix"
+    },
+    {
+      "file": "tests/classattr.spec.ts",
+      "old": "page.locator('[aria-label=\"Button\"]')",
+      "expect": "refused",
+      "reason": "ambiguous on route /classattr.html: several elements match the intent (candidates: button), refusing to guess",
+      "test": "records the primary click"
+    },
+    {
+      "file": "tests/classattr-heal.spec.ts",
+      "old": "page.locator('[aria-label=\"Button\"]')",
+      "expect": "healed",
+      "level": "role",
+      "test": "clicks the named primary button"
+    },
+    {
+      "file": "tests/classattr-heal.spec.ts",
+      "old": "page.locator('#click-note')",
+      "expect": "intact",
+      "test": "clicks the named primary button"
     }
   ]
 }

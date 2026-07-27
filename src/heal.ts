@@ -87,6 +87,12 @@ export interface HealOptions {
    * collection on SPA pages. Default 2000; 0 disables the wait.
    */
   settleMs?: number;
+  /**
+   * Detailed progress on stderr: per-route probe outcomes and fuzzy
+   * candidate scoring. Adds lines only — never alters verdicts, reasons,
+   * or the report.
+   */
+  verbose?: boolean;
 }
 
 export type HealEvent =
@@ -151,6 +157,53 @@ export interface HealResult {
   specFiles: Record<string, string[]>;
   /** Targets that matched NO locator call in the gathered sources. */
   unmatchedTargets: HealTarget[];
+  /** Files that could not be read while gathering; their locators were skipped. */
+  fileErrors: FileError[];
+  /**
+   * The EXACT write plan behind this result's healed verdicts: per file,
+   * the source as scanned plus the edits computed against it. Applying
+   * this plan (applyHealPlan) writes precisely the previewed diff — no
+   * re-probe, no re-scoring, no chance for the page to change the verdict
+   * between preview and consent. Present in preview runs too.
+   */
+  plan: HealPlanEntry[];
+}
+
+export interface HealPlanEntry {
+  file: string;
+  /** The file content the edits were computed against. */
+  src: string;
+  edits: Edit[];
+}
+
+/**
+ * Write a previously computed heal plan to disk, exactly as previewed.
+ * Consent (--yes or the prompt) must only ever gate THIS — never a second
+ * probe whose verdicts could differ from what the user approved.
+ */
+export function applyHealPlan(plan: HealPlanEntry[]): string[] {
+  const written: string[] = [];
+  for (const entry of plan) {
+    fs.writeFileSync(entry.file, applyEdits(entry.src, entry.edits));
+    written.push(entry.file);
+  }
+  return written;
+}
+
+/**
+ * Re-write planned files KEEPING only the edits not excluded: the revert
+ * path for heals whose verify re-run still failed. A file whose every
+ * edit is excluded is restored byte-identical to the scanned source.
+ */
+export function applyHealPlanExcluding(
+  plan: HealPlanEntry[],
+  excluded: (file: string, edit: Edit) => boolean,
+): void {
+  for (const entry of plan) {
+    if (!entry.edits.some((e) => excluded(entry.file, e))) continue;
+    const kept = entry.edits.filter((e) => !excluded(entry.file, e));
+    fs.writeFileSync(entry.file, applyEdits(entry.src, kept));
+  }
 }
 
 /* ─────────────────────────── parsing ─────────────────────────── */
@@ -385,6 +438,53 @@ function parseLocatorCalls(src: string, file: string): LocatorCall[] {
 
 interface SourceFile { path: string; src: string }
 
+/** A file error met while gathering sources: reported, never fatal. */
+export interface FileError {
+  /** The fs operation that failed ("read", "walk"). */
+  operation: string;
+  /** The exact path it failed on. */
+  path: string;
+  /** The spec being processed when it happened. */
+  spec: string;
+  message: string;
+}
+
+/**
+ * Every spec file under a directory, recursive. Only REGULAR files are
+ * read anywhere downstream; directories are walked — including a
+ * directory whose NAME looks like a spec file (a real-world tree had
+ * one, and reading it was an EISDIR crash). Symlinks are skipped (cycle
+ * safety) and non-spec files ignored, both noted via `note` (--verbose).
+ */
+export function collectSpecFiles(root: string, note?: (line: string) => void): string[] {
+  const out: string[] = [];
+  const walk = (dir: string): void => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (e) {
+      note?.(`[verbose] skipping unreadable directory ${dir}: ${(e as Error).message}`);
+      return;
+    }
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      const p = path.join(dir, entry.name);
+      if (entry.isSymbolicLink()) {
+        note?.(`[verbose] skipping symlink ${p}`);
+        continue;
+      }
+      if (entry.isDirectory()) {
+        walk(p);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (/\.(spec|test)\.(ts|js)$/.test(entry.name)) out.push(p);
+      else note?.(`[verbose] skipping non-spec file ${p}`);
+    }
+  };
+  walk(root);
+  return out.sort();
+}
+
 /**
  * The spec plus every relative-imported page-object file that exists on
  * disk, followed RECURSIVELY: a page object importing another page object
@@ -395,6 +495,7 @@ function gatherFiles(
   specSrc: string,
   followImports: boolean,
   pageObjectDirs?: string[],
+  onFileError?: (operation: string, p: string, e: unknown) => void,
 ): SourceFile[] {
   const files: SourceFile[] = [{ path: specPath, src: specSrc }];
   const seen = new Set([specPath]);
@@ -409,7 +510,14 @@ function gatherFiles(
         const resolved = resolveImport(dir, spec);
         if (resolved && !seen.has(resolved)) {
           seen.add(resolved);
-          const f = { path: resolved, src: fs.readFileSync(resolved, 'utf8') };
+          let src: string;
+          try {
+            src = fs.readFileSync(resolved, 'utf8');
+          } catch (e) {
+            onFileError?.('read', resolved, e);
+            continue;
+          }
+          const f = { path: resolved, src };
           files.push(f);
           queue.push(f);
         }
@@ -427,7 +535,11 @@ function gatherFiles(
       if (seen.has(p)) continue;
       try { if (!fs.statSync(p).isFile()) continue; } catch { continue; }
       seen.add(p);
-      files.push({ path: p, src: fs.readFileSync(p, 'utf8') });
+      try {
+        files.push({ path: p, src: fs.readFileSync(p, 'utf8') });
+      } catch (e) {
+        onFileError?.('read', p, e);
+      }
     }
   }
   return files;
@@ -489,7 +601,7 @@ async function resolveBaseUrl(
     // report, never a silent absence.
     const name = path.basename(res.configPath);
     if (res.loadError) {
-      console.error(`${name} failed to load (${res.loadError}); falling back to goto() scan / --base-url`);
+      console.error(`${name} failed to load (${res.loadError}); falling back to goto() scan / --base-url — probing quality is reduced without the config (routes, baseURL, and storage state may be missing)`);
     } else if (res.disagreement) {
       const list = res.disagreement.map((p) => `${p.name}: ${p.baseURL}`).join(', ');
       console.error(`${name} defines projects with different baseURLs (${list}); pass --project <name> or --base-url`);
@@ -880,7 +992,7 @@ async function confirmSameElement(locator: ReturnType<typeof buildLocator>, toke
 
 /* ─────────────────────────── write-back ─────────────────────────── */
 
-interface Edit { line: number; startCol: number; endLine: number; endCol: number; newRaw: string }
+export interface Edit { line: number; startCol: number; endLine: number; endCol: number; newRaw: string }
 
 /** Replace each edit's span (possibly several lines, for a wrapped call)
  *  with its single-line replacement. Bottom-up, right-to-left, so earlier
@@ -984,6 +1096,28 @@ const STATE_TOKENS = new Set([
   'toast', 'modal', 'alert', 'result', 'notification', 'snackbar',
   'dialog', 'popup', 'confirmation', 'flash',
 ]);
+
+/**
+ * Roles that exist in the accessibility tree only while their widget is
+ * in an open/active state — invisible to any fresh-load probe. Value:
+ * the widget noun for the teaching refusal, adapted per role.
+ */
+const STATE_GATED_ROLES: Record<string, string> = {
+  option: 'a dropdown/listbox',
+  menuitem: 'a menu',
+  menuitemcheckbox: 'a menu',
+  menuitemradio: 'a menu',
+  dialog: 'a dialog',
+  tooltip: 'a tooltip',
+};
+
+/** The widget noun for a state-gated getByRole call, else null. */
+function stateGatedRole(call: LocatorCall): { role: string; widget: string } | null {
+  if (call.method !== 'getByRole') return null;
+  const role = (call.args.role ?? '').toLowerCase();
+  const widget = STATE_GATED_ROLES[role];
+  return widget ? { role, widget } : null;
+}
 
 function stateDependencyHint(call: LocatorCall): string | null {
   const a = call.args;
@@ -1137,7 +1271,10 @@ async function scanIdentifiers(
       for (const el of textEls) {
         if (textCount >= 2000) break;
         const tag = el.tagName.toLowerCase();
-        if (tag === 'label' || tag === 'option' || tag === 'script' || tag === 'style' || tag === 'noscript') continue;
+        // code/pre/kbd/samp: code samples are never element identity
+        // (documentation pages display SELECTOR STRINGS in them).
+        if (tag === 'label' || tag === 'option' || tag === 'script' || tag === 'style' || tag === 'noscript'
+          || tag === 'code' || tag === 'pre' || tag === 'kbd' || tag === 'samp') continue;
         if (el.children.length > 0 || el.closest('label')) continue;
         const t = (el.textContent ?? '').replace(/\s+/g, ' ').trim();
         if (!t || t.length > 80) continue;
@@ -1365,21 +1502,55 @@ type RouteOutcome =
     };
 
 export async function heal(opts: HealOptions): Promise<HealResult> {
-  const specPaths = (opts.specPaths ?? (opts.specPath ? [opts.specPath] : []))
+  const givenPaths = (opts.specPaths ?? (opts.specPath ? [opts.specPath] : []))
     .map((p) => path.resolve(p));
-  if (specPaths.length === 0) throw new Error('No spec path given.');
+  if (givenPaths.length === 0) throw new Error('No spec path given.');
   const write = opts.write !== false;
+  const verboseNote = opts.verbose ? (line: string): void => console.error(line) : undefined;
+
+  // A DIRECTORY spec path is walked for spec files, never read: the
+  // real-world "qa-core-heal tests/systematic" crash was a directory
+  // flowing into readFileSync (bare EISDIR, a forbidden message shape).
+  const specPaths: string[] = [];
+  for (const sp of givenPaths) {
+    if (!fs.existsSync(sp)) throw new Error(`Spec not found: ${sp}`);
+    if (fs.statSync(sp).isDirectory()) {
+      const found = collectSpecFiles(sp, verboseNote);
+      if (found.length === 0) throw new Error(`No spec files (*.spec.ts/js, *.test.ts/js) found under directory: ${sp}`);
+      specPaths.push(...found);
+    } else {
+      specPaths.push(sp);
+    }
+  }
 
   // Gather each spec's files, deduped across specs: a page object imported
   // by several specs is scanned ONCE, but remembers every importing spec so
-  // its locators can be probed on each of their routes.
+  // its locators can be probed on each of their routes. A file that cannot
+  // be read is a reported, per-spec SKIP — never a crash: the story names
+  // the operation, the exact path, and the spec being processed, and the
+  // run continues with the remaining locators.
+  const fileErrors: FileError[] = [];
+  const relSpec = (p: string): string => path.relative(process.cwd(), p).split(path.sep).join('/');
+  const fileError = (operation: string, p: string, spec: string, e: unknown): void => {
+    const message = e instanceof Error ? e.message : String(e);
+    fileErrors.push({ operation, path: p, spec: relSpec(spec), message });
+    console.error(`file error: ${operation} ${p} failed while processing spec ${relSpec(spec)}: ${message}; skipping`);
+  };
   const files: SourceFile[] = [];
   const seenFiles = new Set<string>();
   const specFiles = new Map<string, string[]>();
   for (const sp of specPaths) {
-    if (!fs.existsSync(sp)) throw new Error(`Spec not found: ${sp}`);
-    const src = fs.readFileSync(sp, 'utf8');
-    const gathered = gatherFiles(sp, src, opts.followImports !== false, opts.pageObjectDirs);
+    let src: string;
+    try {
+      const st = fs.statSync(sp);
+      if (!st.isFile()) throw new Error(`EISDIR: not a regular file`);
+      src = fs.readFileSync(sp, 'utf8');
+    } catch (e) {
+      fileError('read', sp, sp, e);
+      continue;
+    }
+    const gathered = gatherFiles(sp, src, opts.followImports !== false, opts.pageObjectDirs,
+      (op, p, e) => fileError(op, p, sp, e));
     const list: string[] = [];
     for (const f of gathered) {
       if (!seenFiles.has(f.path)) {
@@ -1696,6 +1867,14 @@ export async function heal(opts: HealOptions): Promise<HealResult> {
         }
       } catch { return null; }
       const verdict = matchFuzzy(source, scanned);
+      if (opts.verbose) {
+        const detail = verdict.kind === 'match'
+          ? `${verdict.value} (${verdict.score.toFixed(2)})`
+          : verdict.kind === 'near-miss'
+            ? verdict.closest.map((c) => `${c.display} (${c.score.toFixed(2)})`).join(', ')
+            : verdict.kind === 'ambiguous' ? verdict.displays.join(', ') : '';
+        console.error(`[verbose] fuzzy '${source}' → ${verdict.kind}${detail ? `: ${detail}` : ''}`);
+      }
       if (verdict.kind === 'none') return null;
       if (verdict.kind === 'near-miss') {
         return {
@@ -1897,6 +2076,22 @@ export async function heal(opts: HealOptions): Promise<HealResult> {
       }
       if (count >= 1) return { kind: 'intact', count };
 
+      // State-gated roles (option, menuitem, dialog, tooltip) exist only
+      // while their widget is open: a fresh-load probe can neither find
+      // nor verify them, and anything the ladder or fuzzy stage "found"
+      // instead would be a wrong heal by construction. The intent ladder
+      // is skipped and NO heal is ever proposed — but the fuzzy scan's
+      // scored NEAR-MISSES are kept as refusal evidence (a match or an
+      // ambiguity verdict is discarded, never healed).
+      if (stateGatedRole(call)) {
+        const gatedSource = fuzzySource(call);
+        if (gatedSource && call.frameChain.length === 0) {
+          const fz = await fuzzyProbe(call, gatedSource);
+          if (fz && fz.kind === 'unresolved' && fz.closest) return fz;
+        }
+        return { kind: 'unresolved' };
+      }
+
       // 2. Broken. A tag-typo'd compound CSS selector is tried FIRST: its
       //    structural evidence (same classes, tag one edit from a real
       //    element name, unique match) outranks anything the weak
@@ -2023,6 +2218,9 @@ export async function heal(opts: HealOptions): Promise<HealResult> {
       for (const t of tasks) {
         if (!t.routes.includes(route)) continue;
         t.outcomes.set(route, await probeCall(t.call, t.strict));
+        if (opts.verbose) {
+          console.error(`[verbose] probe ${t.call.raw} @ ${routeLabel(route)} → ${t.outcomes.get(route)!.kind}`);
+        }
       }
     }
 
@@ -2119,7 +2317,14 @@ export async function heal(opts: HealOptions): Promise<HealResult> {
         // which — but the closest valid tag makes the typo case one edit
         // away from fixed. Dashed tags are never auto-healed.
         const dashHint = dashedTagHint(call);
-        refuse(call, withClosedNote(closest
+        // A state-gated role outranks every other explanation: the
+        // element's absence on a fresh load is EXPECTED, not evidence of
+        // removal or renaming. Scored near-misses, when any exist, stay
+        // appended after the teaching line.
+        const gated = stateGatedRole(call);
+        refuse(call, withClosedNote(gated
+          ? `not found on ${where}: role '${gated.role}' elements exist only while ${gated.widget} is open; a fresh page load cannot show them. Static probing cannot verify this locator - check the ${gated.role} name manually or re-record it.${closest ? ` Closest candidates below the confidence threshold: ${closest}` : ''}`
+          : closest
           ? `not found on ${where}: closest candidates below the confidence threshold: ${closest}`
           : hint
             ? withCompoundHint(call, `not found on ${where}: element may be state-dependent (selector token "${hint}" suggests it appears only after user actions); static healing cannot verify it`)
@@ -2194,14 +2399,12 @@ export async function heal(opts: HealOptions): Promise<HealResult> {
     await browser?.close();
   }
 
-  const filesWritten: string[] = [];
-  if (write) {
-    for (const [file, edits] of editsByFile) {
-      const original = files.find((f) => f.path === file)!.src;
-      fs.writeFileSync(file, applyEdits(original, edits));
-      filesWritten.push(file);
-    }
-  }
+  const healPlan: HealPlanEntry[] = [...editsByFile].map(([file, edits]) => ({
+    file,
+    src: files.find((f) => f.path === file)!.src,
+    edits,
+  }));
+  const filesWritten: string[] = write ? applyHealPlan(healPlan) : [];
 
   opts.onEvent?.({
     type: 'done', healed: healed.length, unhealed: unhealable.length,
@@ -2215,5 +2418,7 @@ export async function heal(opts: HealOptions): Promise<HealResult> {
     locators,
     specFiles: Object.fromEntries(specFiles),
     unmatchedTargets,
+    fileErrors,
+    plan: healPlan,
   };
 }

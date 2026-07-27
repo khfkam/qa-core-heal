@@ -121,6 +121,110 @@ export default defineConfig({
   }
 });
 
+// 0.3.0: config variants must all load the way Playwright loads them —
+// no silent downgrade to the weaker goto()/--base-url fallback probe.
+test('all four config variants load: CJS .js, ESM .js (type:module), .mjs, .ts', async () => {
+  const variants = [
+    ['cjs-js', '{ "name": "v", "private": true }', 'playwright.config.js',
+      "module.exports = { use: { baseURL: 'https://cjs-js.example' } };\n", 'https://cjs-js.example'],
+    ['esm-js-module', '{ "name": "v", "private": true, "type": "module" }', 'playwright.config.js',
+      "import { defineConfig } from '@playwright/test';\nexport default defineConfig({ use: { baseURL: 'https://esm-js.example' } });\n", 'https://esm-js.example'],
+    ['mjs', '{ "name": "v", "private": true }', 'playwright.config.mjs',
+      "import { defineConfig } from '@playwright/test';\nexport default defineConfig({ use: { baseURL: 'https://mjs.example' } });\n", 'https://mjs.example'],
+    ['ts', '{ "name": "v", "private": true, "type": "module" }', 'playwright.config.ts',
+      "import { defineConfig } from '@playwright/test';\nexport default defineConfig({ use: { baseURL: 'https://ts.example' } });\n", 'https://ts.example'],
+  ];
+  for (const [label, pkg, configName, source, expected] of variants) {
+    const dir = tempProject({ 'package.json': pkg, [configName]: source });
+    try {
+      const res = await resolvePlaywrightConfig(dir);
+      assert.equal(res.loadError, undefined, `${label}: ${res.loadError}`);
+      assert.equal(res.baseUrl, expected, label);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test('the real-repo shape: ESM-syntax .js config in a package WITHOUT "type": "module"', async () => {
+  // Playwright's transpiling loader tolerates this; a naive import()
+  // parses the file as CJS and dies on the first import statement. This
+  // was silently downgrading whole runs to the fallback probe.
+  const dir = tempProject({
+    'package.json': '{ "name": "real-repo", "private": true }',
+    'helper.cjs-style.js': '',
+    'playwright.config.js': `import { defineConfig } from '@playwright/test';
+
+export default defineConfig({
+  use: { baseURL: 'https://esm-in-cjs.example' },
+});
+`,
+  });
+  try {
+    const res = await resolvePlaywrightConfig(dir);
+    assert.equal(res.loadError, undefined, res.loadError);
+    assert.equal(res.baseUrl, 'https://esm-in-cjs.example');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an ESM .js config importing a genuinely-CJS .js helper still loads both', async () => {
+  // The force-module hook must sniff per file: the helper uses
+  // module.exports and must stay CJS.
+  const dir = tempProject({
+    'package.json': '{ "name": "mixed", "private": true }',
+    'helper.js': "module.exports = { base: 'https://mixed.example' };\n",
+    'playwright.config.js': `import { defineConfig } from '@playwright/test';
+const helper = require('./helper.js');
+export default defineConfig({ use: { baseURL: helper.base } });
+`,
+  });
+  try {
+    const res = await resolvePlaywrightConfig(dir);
+    assert.equal(res.loadError, undefined, res.loadError);
+    assert.equal(res.baseUrl, 'https://mixed.example');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a genuinely syntax-broken config falls back with the full story and the reduced-quality note', async () => {
+  const server = await new Promise((resolve) => {
+    const s = http.createServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end('<html><body><h1>Home</h1></body></html>');
+    });
+    s.listen(0, '127.0.0.1', () => resolve(s));
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const dir = tempProject({
+    'package.json': '{ "name": "broken", "private": true, "type": "module" }',
+    'playwright.config.js': 'export default { use: { baseURL: "x" }\n', // unclosed brace
+  });
+  fs.mkdirSync(path.join(dir, 'tests'));
+  fs.writeFileSync(path.join(dir, 'tests/a.spec.ts'), `import { test } from '@playwright/test';
+test('x', async ({ page }) => {
+  await page.goto('${base}/');
+  await page.locator('#zz-nope').click();
+});
+`);
+  try {
+    const { stderr, status } = await new Promise((resolve) => {
+      const child = spawn(process.execPath, [cliJs, 'tests/a.spec.ts', '--scan', '--dry-run'], { cwd: dir });
+      let err = '';
+      child.stderr.on('data', (d) => { err += d; });
+      child.on('close', (code) => resolve({ stderr: err, status: code }));
+    });
+    assert.equal(status, 0, stderr);
+    assert.match(stderr, /playwright\.config\.js failed to load \(.*SyntaxError.*\); falling back to goto\(\) scan \/ --base-url/);
+    assert.match(stderr, /probing quality is reduced without the config/);
+  } finally {
+    server.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('an ESM-syntax .ts config loads even when the package context is CommonJS', async () => {
   // Deterministic form of the same regression: with "type": "commonjs"
   // (or a typeless package on Nodes whose syntax detection skips .ts),

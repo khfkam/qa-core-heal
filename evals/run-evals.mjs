@@ -134,11 +134,12 @@ function runPlaywright(suiteDir) {
   return specs.sort((a, b) => a.title.localeCompare(b.title));
 }
 
-function runCli(suiteDir, args) {
+function runCliRaw(suiteDir, args) {
   return spawnSync('node', [cliJs, ...args], {
     cwd: suiteDir, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024,
   });
 }
+const runCli = runCliRaw;
 
 async function runSuite(suite) {
   const suiteDir = path.join(evalsDir, 'fixtures', suite.name);
@@ -158,9 +159,20 @@ async function runSuite(suite) {
     if (dryRun.status !== 0) throw new Error(`heal dry-run failed for ${suite.name}: ${dryRun.stderr}`);
     const dry = JSON.parse(dryRun.stdout);
     runCli(suiteDir, ['--scan', '--apply', '--yes', '--no-verify']);
+    // PERMANENT --yes invariance assertion (static side): what --yes
+    // applied must be verbatim what the no-yes dry run previewed.
+    const yesNotes = [];
+    for (const l of dry.locators.filter((x) => x.status === 'healed')) {
+      const src = fs.readFileSync(path.join(suiteDir, l.file), 'utf8');
+      if (!src.includes(l.new)) {
+        yesNotes.push(`YES-INVARIANCE: previewed heal not applied verbatim with --yes: ${l.old} -> ${l.new}`);
+      }
+    }
     const finalTests = runPlaywright(suiteDir);
 
-    return score(suite, expected, dry, brokenTests, finalTests);
+    const result = score(suite, expected, dry, brokenTests, finalTests);
+    result.notes.push(...yesNotes);
+    return result;
   } finally {
     server?.kill();
     restoreSources(snap);
@@ -201,6 +213,40 @@ async function runScenarioSuite(suite) {
   };
   const sourcesUnchanged = () =>
     [...snap].every(([f, src]) => fs.readFileSync(f, 'utf8') === src);
+
+  // PERMANENT --yes invariance assertion, applied to EVERY scenario run
+  // that passes -y: first a no-yes --json preview captures the verdicts,
+  // then the real run executes; every previewed heal must land verbatim
+  // in the sources and every previewed refusal reason must appear in the
+  // --yes run's output. --yes may only ever skip the prompt.
+  const runCli = (dir, args) => {
+    if (!args.includes('-y') && !args.includes('--yes')) return runCliRaw(dir, args);
+    const previewArgs = args.filter((a) => a !== '-y' && a !== '--yes' && a !== '--json');
+    previewArgs.push('--json');
+    const preview = runCliRaw(dir, previewArgs);
+    let previewLocs = [];
+    try {
+      previewLocs = JSON.parse(preview.stdout).locators ?? [];
+    } catch {
+      notes.push(`YES-INVARIANCE: preview JSON unparseable for: ${args.join(' ')}`);
+    }
+    const real = runCliRaw(dir, args);
+    for (const l of previewLocs) {
+      if (l.status === 'healed') {
+        // A heal the real run applied and then REVERTED (verify re-run
+        // still failing) is a legitimate divergence from the preview.
+        const wasReverted = real.stdout.includes('heal reverted: re-run still failing after heal')
+          || real.stdout.includes('"reverted": true');
+        const src = fs.readFileSync(path.join(dir, l.file), 'utf8');
+        if (!src.includes(l.new) && !wasReverted) {
+          notes.push(`YES-INVARIANCE: previewed heal not applied verbatim with --yes: ${l.old} -> ${l.new}`);
+        }
+      } else if (l.status === 'refused' && l.reason && !real.stdout.includes(l.reason)) {
+        notes.push(`YES-INVARIANCE: refusal verdict differs with --yes: ${l.old} (${l.reason})`);
+      }
+    }
+    return real;
+  };
 
   try {
     await waitForServer(`http://127.0.0.1:${suite.port}/`);
@@ -599,6 +645,105 @@ async function runScenarioSuite(suite) {
       cleanArtifacts(suiteDir);
     }
 
+    // 20. 0.3.0: pointer interception. The target RESOLVES — the locator
+    //     is healthy — but a persistent invisible overlay eats the click.
+    //     Non-locator, the UX-defect verdict names the interceptor, and
+    //     sources stay untouched.
+    {
+      const r = runCli(suiteDir, ['tests/overlay.spec.ts', '-y']);
+      const unchanged = sourcesUnchanged();
+      if (!unchanged) wrongHeals++;
+      const msgOk = r.stdout.includes("not a locator problem, healing won't fix this")
+        && r.stdout.includes('is intercepting pointer events on the target')
+        && r.stdout.includes('(<div class="promo-overlay"></div>)')
+        && r.stdout.includes('an overlay blocking users');
+      scenario('persistent overlay: non-locator UX-defect verdict naming the interceptor',
+        r.status === 0 && msgOk && unchanged
+          && !r.stdout.includes('· opened') && !r.stdout.includes('✓ healed'),
+        `exit ${r.status}, msgOk ${msgOk}, unchanged ${unchanged}`);
+    }
+
+    // 21. Counter-case: the overlay clears after 2s, Playwright's own
+    //     retries absorb it, the test passes — run-first does NOTHING.
+    {
+      const r = runCli(suiteDir, ['tests/overlay-clears.spec.ts']);
+      const unchanged = sourcesUnchanged();
+      if (!unchanged) wrongHeals++;
+      scenario('transient overlay: test passes, tool does nothing',
+        r.status === 0
+          && r.stdout.includes('All tests passing. Nothing to heal.')
+          && !r.stdout.includes('scanned')
+          && !r.stdout.includes('· opened')
+          && unchanged,
+        `exit ${r.status}, unchanged ${unchanged}`);
+    }
+
+    // 22. 0.3.0: state-gated ROLES. option/menuitem/dialog/tooltip exist
+    //     in the accessibility tree only while their widget is open; a
+    //     fresh-load probe cannot see them. The refusal must say so with
+    //     the role-adapted widget noun — and this path must never propose
+    //     a heal.
+    {
+      const r = runCli(suiteDir, ['tests/option-role.spec.ts', '-y']);
+      const unchanged = sourcesUnchanged();
+      if (!unchanged) wrongHeals++;
+      const msgOk = r.stdout.includes("role 'option' elements exist only while a dropdown/listbox is open; "
+        + 'a fresh page load cannot show them. Static probing cannot verify this locator '
+        + '- check the option name manually or re-record it');
+      scenario('closed combobox: getByRole option refuses with the widget-state explanation',
+        r.status === 0 && r.stdout.includes('locator failure:') && msgOk
+          && !r.stdout.includes('✓ healed') && unchanged,
+        `exit ${r.status}, msgOk ${msgOk}, unchanged ${unchanged}`);
+    }
+
+    // 23. Counter-case: listitem is NOT widget-gated — a below-threshold
+    //     miss keeps the NORMAL scored near-miss refusal.
+    {
+      const r = runCli(suiteDir, ['tests/listitem.spec.ts', '-y']);
+      const unchanged = sourcesUnchanged();
+      if (!unchanged) wrongHeals++;
+      const nearMiss = /closest candidates below the confidence threshold: "Quarterly revenue report" \(0\.\d\d\)/.test(r.stdout);
+      const notGated = !r.stdout.includes('elements exist only while');
+      scenario('plain listitem miss: normal below-threshold near-miss, not the gated wording',
+        r.status === 0 && r.stdout.includes('locator failure:')
+          && nearMiss && notGated && !r.stdout.includes('✓ healed') && unchanged,
+        `exit ${r.status}, nearMiss ${nearMiss}, notGated ${notGated}, unchanged ${unchanged}`);
+    }
+
+    // 24. 0.3.0 revert contract: a heal that LOOKS right by identity but
+    //     targets the wrong element for the test — the verify re-run
+    //     still fails, so the edit is REVERTED (file byte-identical),
+    //     announced loudly, audited as applied+unverified+reverted, exit
+    //     code 1, and --json carries reverted per verdict.
+    {
+      const r = runCli(suiteDir, ['tests/revert.spec.ts', '-y']);
+      const unchanged = sourcesUnchanged();
+      const msgOk = r.stdout.includes('heal reverted: re-run still failing after heal')
+        && r.stdout.includes('1 heal(s) reverted: re-run still failing after heal');
+      let auditOk = false;
+      try {
+        const lines = fs.readFileSync(path.join(suiteDir, '.qa-core/heal-log.jsonl'), 'utf8').trim().split('\n');
+        const entry = JSON.parse(lines[lines.length - 1]);
+        auditOk = entry.applied === true && entry.verified === false && entry.reverted === true;
+      } catch { /* auditOk stays false */ }
+      restoreSources(snap);
+      cleanArtifacts(suiteDir);
+      const j = runCli(suiteDir, ['tests/revert.spec.ts', '-y', '--json']);
+      let jsonOk = false;
+      try {
+        const payload = JSON.parse(j.stdout);
+        const v = payload.verdicts.find((x) => x.healApplied);
+        jsonOk = v != null && v.reverted === true && v.verified === false;
+      } catch { /* jsonOk stays false */ }
+      const jUnchanged = sourcesUnchanged();
+      scenario('wrong-element heal: verify fails, edit reverted, audit triple, json reverted',
+        r.status === 1 && msgOk && unchanged && auditOk
+          && j.status === 1 && jsonOk && jUnchanged,
+        `exit ${r.status}/${j.status}, msgOk ${msgOk}, unchanged ${unchanged}/${jUnchanged}, auditOk ${auditOk}, jsonOk ${jsonOk}`);
+      restoreSources(snap);
+      cleanArtifacts(suiteDir);
+    }
+
     // 4. State-gated element (reached by clicking, no goto names its page):
     //    --scan must refuse; the default run mode heals on the REAL failure
     //    URL taken from the trace.
@@ -628,7 +773,7 @@ async function runScenarioSuite(suite) {
     cleanArtifacts(suiteDir);
   }
 
-  const SCENARIOS = 19;
+  const SCENARIOS = 24;
   return {
     suite: suite.name,
     locators: 17,
@@ -855,5 +1000,5 @@ if (only) {
   fs.writeFileSync(path.join(evalsDir, 'RESULTS.md'), renderMarkdown(results, totals));
   console.log('\nWrote evals/results.json and evals/RESULTS.md');
 }
-const anyWrong = totals.wrongHeals > 0 || totals.misses > 0 || results.some((r) => !r.finalOk || r.notes.some((n) => n.startsWith('FIXTURE') || n.startsWith('WRONG')));
+const anyWrong = totals.wrongHeals > 0 || totals.misses > 0 || results.some((r) => !r.finalOk || r.notes.some((n) => n.startsWith('FIXTURE') || n.startsWith('WRONG') || n.startsWith('YES-INVARIANCE')));
 process.exitCode = anyWrong ? 1 : 0;

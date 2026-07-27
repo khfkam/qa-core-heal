@@ -108,13 +108,25 @@ const rewriteNamedImports = (src) => {
 };
 
 export async function load(url, context, nextLoad) {
-  if (new URL(url).pathname.endsWith('.ts')) {
+  const u = new URL(url);
+  if (u.protocol === 'file:' && u.pathname.endsWith('.ts')) {
     const src = fs.readFileSync(fileURLToPath(url), 'utf8');
     return {
       format: 'module',
       source: rewriteNamedImports(stripTypeScriptTypes(src)),
       shortCircuit: true,
     };
+  }
+  // ESM-syntax .js in a typeless/commonjs package: Node parses it as CJS
+  // and dies on the first import statement, while Playwright's own
+  // transpiling loader tolerates it. PROJECT files only (never
+  // node_modules), and only when the source actually looks ESM — a
+  // genuinely-CJS helper imported by the same config must stay CJS.
+  if (u.protocol === 'file:' && u.pathname.endsWith('.js') && !u.pathname.includes('/node_modules/')) {
+    const src = fs.readFileSync(fileURLToPath(url), 'utf8');
+    if (/^[ \\t]*(import|export)\\b/m.test(src)) {
+      return { format: 'module', source: src, shortCircuit: true };
+    }
   }
   return nextLoad(url, context);
 }
@@ -180,9 +192,11 @@ let error = null;
   } catch (e) {
     importError = e;
   }
-  // 2. .ts that failed to import: retry with the ESM-forcing hook (the
-  //    query buster skips the cached failed evaluation).
-  if (!mod && configPath.endsWith('.ts')) {
+  // 2. A .ts config, or an ESM-syntax config the package context parsed
+  //    as CJS ("Cannot use import statement outside a module"): retry with
+  //    the ESM-forcing hook, the way Playwright's own transpiling loader
+  //    tolerates these. (The query buster skips the cached failure.)
+  if (!mod && (configPath.endsWith('.ts') || looksEsm)) {
     try {
       const { register } = await import('node:module');
       register(${JSON.stringify(HOOK_URL)});

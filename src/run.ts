@@ -49,8 +49,10 @@ function firstLine(msg: string): string {
  * that stays non-locator even with a call log.
  *
  * Non-locator: found-element assertion mismatches, count mismatches with
- * actual > 0, navigation/network errors, thrown app errors, and timeouts
- * with no pending locator action.
+ * actual > 0, pointer-interception timeouts (the target resolved; an
+ * overlay is eating the input — possibly a real UX defect), navigation/
+ * network errors, thrown app errors, and timeouts with no pending locator
+ * action.
  */
 export function classifyFailure(rawMessage: string): FailureClass {
   const msg = stripAnsi(rawMessage);
@@ -72,6 +74,21 @@ export function classifyFailure(rawMessage: string): FailureClass {
     && (/locator resolved to 0 elements/.test(msg) || /^Received:\s*0\s*$/m.test(msg))
   ) {
     return { kind: 'locator', selector: extractSelector(msg) };
+  }
+  // Pointer interception: the target RESOLVED and is actionable — the
+  // locator is healthy, never a heal candidate — but another element sits
+  // on top of it and eats the input. That may be a genuine UX defect (an
+  // overlay blocking real users), so the verdict says so and names the
+  // interceptor from the call log. Checked before the resolved-to gate
+  // below so the specific verdict wins over the generic timeout summary.
+  if (/intercepts pointer events/.test(msg)) {
+    const interceptor = msg.match(/-\s+([^\n]+?)\s+intercepts pointer events/)?.[1]?.trim();
+    return {
+      kind: 'other',
+      summary: `not a locator problem: another element ${interceptor ? `(${interceptor}) ` : ''}`
+        + 'is intercepting pointer events on the target. The selector is fine; '
+        + 'this may be a real defect - an overlay blocking users.',
+    };
   }
   // The locator resolved to a real element: whatever failed, it was not
   // the locator's identity.

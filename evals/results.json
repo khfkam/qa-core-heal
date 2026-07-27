@@ -449,22 +449,22 @@
     },
     {
       "suite": "fuzzy-typos",
-      "locators": 13,
-      "broken": 8,
-      "healedExpected": 3,
-      "intactExpected": 2,
-      "correctHeals": 3,
-      "correctRefusals": 5,
-      "correctIntact": 2,
+      "locators": 16,
+      "broken": 10,
+      "healedExpected": 4,
+      "intactExpected": 3,
+      "correctHeals": 4,
+      "correctRefusals": 6,
+      "correctIntact": 3,
       "wrongHeals": 0,
       "misses": 0,
-      "levelMatches": 3,
-      "healedGot": 3,
-      "brokenRunFailedTests": 8,
-      "brokenRunTotalTests": 9,
-      "finalPassed": 4,
-      "finalFailed": 5,
-      "expectedFailures": 5,
+      "levelMatches": 4,
+      "healedGot": 4,
+      "brokenRunFailedTests": 10,
+      "brokenRunTotalTests": 11,
+      "finalPassed": 5,
+      "finalFailed": 6,
+      "expectedFailures": 6,
       "finalOk": true,
       "perLocator": [
         {
@@ -575,6 +575,39 @@
           "expectLevel": null,
           "gotLevel": "css",
           "testPassed": false,
+          "verdict": "correct-intact"
+        },
+        {
+          "file": "tests/classattr.spec.ts",
+          "old": "page.locator('[aria-label=\"Button\"]')",
+          "expect": "refused",
+          "got": "refused",
+          "gotNew": null,
+          "expectLevel": null,
+          "gotLevel": "css",
+          "testPassed": false,
+          "verdict": "correct-refusal"
+        },
+        {
+          "file": "tests/classattr-heal.spec.ts",
+          "old": "page.locator('[aria-label=\"Button\"]')",
+          "expect": "healed",
+          "got": "healed",
+          "gotNew": "page.getByRole(\"button\", {\"name\":\"Button\",\"exact\":true})",
+          "expectLevel": "role",
+          "gotLevel": "role",
+          "testPassed": true,
+          "verdict": "correct-heal"
+        },
+        {
+          "file": "tests/classattr-heal.spec.ts",
+          "old": "page.locator('#click-note')",
+          "expect": "intact",
+          "got": "intact",
+          "gotNew": null,
+          "expectLevel": null,
+          "gotLevel": "css",
+          "testPassed": true,
           "verdict": "correct-intact"
         }
       ],
@@ -905,13 +938,13 @@
       "misses": 0,
       "levelMatches": 17,
       "healedGot": 17,
-      "brokenRunTotalTests": 19,
-      "finalPassed": 19,
+      "brokenRunTotalTests": 24,
+      "finalPassed": 24,
       "finalFailed": 0,
       "expectedFailures": 0,
       "finalOk": true,
-      "scenariosPassed": 19,
-      "scenariosTotal": 19,
+      "scenariosPassed": 24,
+      "scenariosTotal": 24,
       "perLocator": [
         {
           "scenario": "passing spec exits 0 with no probing",
@@ -1004,6 +1037,31 @@
           "detail": "exit 0, healed true, noIdHeal true, green true"
         },
         {
+          "scenario": "persistent overlay: non-locator UX-defect verdict naming the interceptor",
+          "verdict": "pass",
+          "detail": "exit 0, msgOk true, unchanged true"
+        },
+        {
+          "scenario": "transient overlay: test passes, tool does nothing",
+          "verdict": "pass",
+          "detail": "exit 0, unchanged true"
+        },
+        {
+          "scenario": "closed combobox: getByRole option refuses with the widget-state explanation",
+          "verdict": "pass",
+          "detail": "exit 0, msgOk true, unchanged true"
+        },
+        {
+          "scenario": "plain listitem miss: normal below-threshold near-miss, not the gated wording",
+          "verdict": "pass",
+          "detail": "exit 0, nearMiss true, notGated true, unchanged true"
+        },
+        {
+          "scenario": "wrong-element heal: verify fails, edit reverted, audit triple, json reverted",
+          "verdict": "pass",
+          "detail": "exit 1/1, msgOk true, unchanged true/true, auditOk true, jsonOk true"
+        },
+        {
           "scenario": "state-gated element: scan refuses, run mode heals on the failure URL",
           "verdict": "pass",
           "detail": "scan refused: true, run exit 0"
@@ -1091,15 +1149,15 @@
     }
   ],
   "totals": {
-    "locators": 117,
-    "broken": 72,
-    "healedExpected": 52,
-    "intactExpected": 8,
-    "correctHeals": 52,
-    "correctRefusals": 20,
-    "correctIntact": 8,
+    "locators": 120,
+    "broken": 74,
+    "healedExpected": 53,
+    "intactExpected": 9,
+    "correctHeals": 53,
+    "correctRefusals": 21,
+    "correctIntact": 9,
     "wrongHeals": 0,
     "misses": 0,
-    "levelMatches": 52
+    "levelMatches": 53
   }
 }

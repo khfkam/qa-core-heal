@@ -165,6 +165,28 @@ test('collectTests extracts failure locations from error.location and the stack'
   ]);
 });
 
+// 0.3.0: pointer interception. The target RESOLVED and is actionable —
+// the locator is healthy — but another element sits on top of it. Real
+// shape captured from Playwright 1.60.
+const INTERCEPT_TIMEOUT = 'TimeoutError: locator.click: Timeout 1500ms exceeded.\nCall log:\n  - waiting for locator(\'#pay-now\')\n    - locator resolved to <button id="pay-now" type="button">Pay now</button>\n  - attempting click action\n    2 × waiting for element to be visible, enabled and stable\n      - element is visible, enabled and stable\n      - scrolling into view if needed\n      - done scrolling\n      - <div class="promo-overlay"></div> intercepts pointer events\n    - retrying click action\n    - waiting 20ms\n    2 × waiting for element to be visible, enabled and stable\n      - element is visible, enabled and stable\n      - scrolling into view if needed\n      - done scrolling\n      - <div class="promo-overlay"></div> intercepts pointer events\n    - retrying click action\n      - waiting 500ms\n';
+
+test('a pointer-interception timeout is non-locator with the UX-defect verdict', () => {
+  const c = classifyFailure(INTERCEPT_TIMEOUT);
+  assert.equal(c.kind, 'other');
+  assert.equal(
+    c.summary,
+    'not a locator problem: another element (<div class="promo-overlay"></div>) is '
+    + 'intercepting pointer events on the target. The selector is fine; this may be '
+    + 'a real defect - an overlay blocking users.',
+  );
+});
+
+test('interception without a namable interceptor still gets the verdict, no parens', () => {
+  const c = classifyFailure('TimeoutError: locator.click: Timeout 1500ms exceeded.\nCall log:\n  - waiting for locator(\'#x\')\n    - locator resolved to <button id="x">Go</button>\n  - attempting click action\n      - intercepts pointer events\n');
+  assert.equal(c.kind, 'other');
+  assert.match(c.summary, /^not a locator problem: another element is intercepting pointer events/);
+});
+
 // GAP 1: evidence-based classification. Real second-repo shape: the wait
 // consumed the TEST timeout, teardown closed the browser, and the pending
 // action died with a "closed" message — the locator evidence lives in the

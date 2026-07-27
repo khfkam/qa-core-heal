@@ -111,7 +111,7 @@ And when `--auth-setup` ran but the redirect still happens: `auth setup ran but 
 
 ## How it decides
 
-**Failure classification is evidence-based.** A failure is a locator problem only when the evidence says so — a `locator.<action>:` / `expect.<matcher>:` prefix, a call-log `waiting for locator(...)` line, an `element(s) not found`, a strict mode violation — anywhere in the error, even when the top-level message is a test timeout or "Target page, context or browser has been closed". A count/existence assertion (`toHaveCount`, `toBeVisible`, `toBeAttached`, `toBeInViewport`) that failed with ZERO elements found is locator evidence too: nothing matched, which is the definition of a broken locator. A locator that RESOLVED to one or more real elements whose value or count merely mismatched is an app problem: `not a locator problem, healing won't fix this` (`toHaveCount(1)` finding 2 is a wrong count, not a wrong selector). Navigation errors, thrown app errors, and timeouts with no pending locator action are reported, never healed.
+**Failure classification is evidence-based.** A failure is a locator problem only when the evidence says so — a `locator.<action>:` / `expect.<matcher>:` prefix, a call-log `waiting for locator(...)` line, an `element(s) not found`, a strict mode violation — anywhere in the error, even when the top-level message is a test timeout or "Target page, context or browser has been closed". A count/existence assertion (`toHaveCount`, `toBeVisible`, `toBeAttached`, `toBeInViewport`) that failed with ZERO elements found is locator evidence too: nothing matched, which is the definition of a broken locator. A locator that RESOLVED to one or more real elements whose value or count merely mismatched is an app problem: `not a locator problem, healing won't fix this` (`toHaveCount(1)` finding 2 is a wrong count, not a wrong selector). A click timeout whose target resolved but where another element `intercepts pointer events` gets the UX-defect verdict — the interceptor is named from the call log, because an overlay eating clicks may be blocking real users too. Navigation errors, thrown app errors, and timeouts with no pending locator action are reported, never healed.
 
 **The heal ladder.** Broken locators re-resolve by semantic intent through Playwright's own preference order — role with accessible name, label, placeholder, text, alt, title, testid, then CSS/XPath — with a fuzzy stage below all of that for typo'd identifiers (`#Emai_l` → `#Email`, a `getByRole` name `"Ema_il_2"` → `"Email"`), scored by edit distance and whole-word token containment (a name mutation "search1" matches the field whose accessible name contains "search" as a word), and only accepted when exactly one candidate clears the bar.
 
@@ -159,12 +159,21 @@ re-resolved element differs: expected an element matching "search panel 42"
 
 **`--scan`.** The static probe: no test execution — every locator in the spec and its page objects probed on its inferred route, reported intact / healed / refused. For locator audits and suites too expensive to run. It cannot see pages only reached mid-test; the run-first default can, which is why a locator `--scan` honestly refuses can heal in the default mode.
 
-**CI.** `--yes` / `-y` applies without prompting. In a non-interactive context the CLI never prompts. Exit codes: **0** heals applied, all tests passing, nothing to heal, or `--dry-run`; **1** error; **2** heals available but not applied — the diff is still printed, so a pipeline can surface it.
+**CI.** `--yes` / `-y` applies without prompting. In a non-interactive context the CLI never prompts. Exit codes: **0** heals applied, all tests passing, nothing to heal, or `--dry-run`; **1** error, or a heal was reverted because its verify re-run still failed; **2** heals available but not applied — the diff is still printed, so a pipeline can surface it.
+
+**Failed verification reverts the heal.** A heal whose verify re-run still fails is undone — the file goes back byte-identical — announced as `heal reverted: re-run still failing after heal`, and the audit keeps the whole history (`applied: true, verified: false, reverted: true`); `--json` verdicts carry `reverted`. Granularity: in run-first mode, when the combined re-run fails, each previously failing test is re-run individually and only the heals whose tests still fail are reverted (heals whose tests pass stay, individually verified); in `--scan` mode there is no per-test signal, so a heal is reverted when any spec owning its file still fails.
 
 | Flag | What it does |
 | --- | --- |
-| `--dry-run` | preview only, never writes |
-| `--json` | one machine-readable JSON object on stdout, byte-stable |
+| `-h, --help` | usage, every flag, one example |
+| `-v, --version` | print the version |
+| `--dry-run` | full classification and proposal, print the exact diff, never write, skip the verify re-run (`dry run: no files changed, heal not verified`) |
+| `-y, --yes` | auto-approve the apply prompt for **evidence-based heals only** — it will never cover suggestion-level changes (those will require a separate `--accept-suggestions`, future) |
+| `--json` | one machine-readable JSON object on stdout, byte-stable (schemaVersion 1, below) |
+| `--output <path>` | additionally write the human report to a file; stdout unchanged |
+| `--verbose` | detailed progress on stderr: probe steps, candidate scoring, child commands executed |
+| `--debug` | implies `--verbose`; adds stack traces and raw child stdout/stderr |
+| `--config <file>` | use this config file instead of the default lookup; missing or invalid errors with the full story |
 | `--base-url <url>` | override base URL resolution (config → goto scan) |
 | `--project <name>` | pick a Playwright project when their baseURLs disagree |
 | `--route <file>=<route>` | override route inference per file (repeatable) |
@@ -174,12 +183,15 @@ re-resolved element differs: expected an element matching "search panel 42"
 | `--no-trace` | skip tracing (custom browser setups); failure URLs come from route inference |
 | `--no-verify` | skip the verification re-run |
 | `--max-heals <n>` | cap heals per run |
+| `--no-color` | disable ANSI colors; the `NO_COLOR` env var is honored automatically |
+
+**The `--json` contract (schemaVersion 1).** The payload always carries `schemaVersion: 1`, a `verdicts` array — one entry per probed locator and per non-locator failure, each with `spec`, `testTitle`, `classification` (`locator` / `non-locator`), `message`, `healApplied`, `before`, `after`, `verified` — and a `summary` of `{ heals, refusals, nonLocator, errors }`, alongside the original per-locator fields. Errors also emit valid JSON with the failure story in `error`. schemaVersion 1 is the compatibility contract: existing fields will not change meaning or disappear within it; additions may appear. Exit codes are unchanged by `--json`.
 
 ## Limitations
 
 Honesty about scope, so you are never surprised:
 
-1. **State-dependent elements cannot be healed by `--scan`.** The static probe sees the page as it loads; an element that exists only after user actions looks broken even when its locator is correct. Heal says so — `element may be state-dependent (selector token "result" suggests it appears only after user actions); static healing cannot verify it` when the selector carries evidence (toast, modal, alert, result), and the hedged `no matching or similar element on the probed page...` when it does not. The run-first default closes most of this gap: it probes the page the test actually failed on.
+1. **State-dependent elements cannot be healed by `--scan`.** The static probe sees the page as it loads; an element that exists only after user actions looks broken even when its locator is correct. Heal says so — `element may be state-dependent (selector token "result" suggests it appears only after user actions); static healing cannot verify it` when the selector carries evidence (toast, modal, alert, result), and the hedged `no matching or similar element on the probed page...` when it does not. State-gated ROLES (`option`, `menuitem`, `dialog`, `tooltip`, …) get the precise version: `role 'option' elements exist only while a dropdown/listbox is open; a fresh page load cannot show them. Static probing cannot verify this locator - check the option name manually or re-record it` — never a heal, since anything found instead would be the wrong element, though scored near-misses stay appended as evidence. The run-first default closes most of the URL side of this gap: it probes the page the test actually failed on.
 2. **Dynamic locators cannot be matched to source.** A selector built at runtime (`page.locator(sel)`, template literals) has no literal call to rewrite. Run mode says so explicitly — `1 failing locator could not be matched to source: <selector> (from <test title>). This is a bug worth reporting.` — and exits non-zero rather than pretending there was nothing to heal.
 3. **Healed locators can rot as the UI evolves** (credit: found by a community tester). A heal is correct against today's page; next month's redesign can invalidate it like any hand-written locator. This is why the run-first default re-verifies on every run instead of trusting yesterday's heal.
 4. It cannot see silent positional drift: if a list reorders, `li:nth-child(2)` still resolves — to a different row — and is reported intact. Heal fixes broken locators; it does not audit passing ones.
@@ -189,12 +201,12 @@ Honesty about scope, so you are never surprised:
 
 ## The numbers
 
-Measured on 13 public eval suites in this repo (117 locators, 72 deliberately broken, one suite probing a live public site, one exercising the run-first default end to end across 19 scenarios), Playwright 1.60:
+Measured on 13 public eval suites in this repo (120 locators, 74 deliberately broken, one suite probing a live public site, one exercising the run-first default end to end across 23 scenarios), Playwright 1.60:
 
 | Measure | Result |
 | --- | --- |
-| Healable breaks fixed and verified by a passing re-run | 52 / 52 |
-| Unhealable breaks correctly refused instead of guessed | 20 / 20 |
+| Healable breaks fixed and verified by a passing re-run | 53 / 53 |
+| Unhealable breaks correctly refused instead of guessed | 21 / 21 |
 | Valid locators wrongly touched | 0 |
 | Wrong heals (locator rewritten to the wrong element) | 0 |
 | Determinism | two full runs, byte-identical results |
