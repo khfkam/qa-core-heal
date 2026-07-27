@@ -25,7 +25,6 @@
     "test": "npm run build && node --test tests/*.test.mjs",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run build",
-    "prepare": "node -e \"require('fs').existsSync('dist/cli.js')||require('child_process').execSync('npm run build',{stdio:'inherit'})\"",
     "test:wrappers": "npm run build && node --test tests/wrapper.test.mjs"
   },
   "dependencies": {
